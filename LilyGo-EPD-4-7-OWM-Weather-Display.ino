@@ -13,6 +13,7 @@
 #include <HTTPClient.h>  // In-built
 
 #include <WiFi.h> // In-built
+#include <Preferences.h>
 #include <SPI.h>  // In-built
 #include <time.h> // In-built
 #include "SPIFFS.h"
@@ -54,7 +55,9 @@ boolean SmallIcon = false;
 #define Small 8  // For icon drawing
 String Time_str = "--:--:--";
 String Date_str = "-- --- ----";
-int wifi_signal, CurrentHour = 0, CurrentMin = 0, CurrentSec = 0, EventCnt = 0, vref = 1100;
+int wifi_signal, CurrentHour = 0, CurrentMin = 0, CurrentSec = 0, EventCnt = 0;
+float BatteryVoltage = 0.0f;
+int64_t BatteryLifeEstimateSeconds = -1;
 //################ PROGRAM VARIABLES and OBJECTS ##########################################
 #define max_readings 24 // Limited to 3-days here, but could go to 5-days = 40
 
@@ -67,10 +70,10 @@ float humidity_readings[max_readings]    = {0};
 float rain_readings[max_readings]        = {0};
 float snow_readings[max_readings]        = {0};
 
-// Local-time refreshes: 06:00, 09:00, 12:00, 15:00, 18:00, and 21:00.
+// Refresh between 06:00 and 21:00. Battery tiers use 3, 6, 12, or 24 hours.
 const int WakeupHour = 6;
 const int SleepHour = 21;
-const int UpdateIntervalHours = 3;
+int UpdateIntervalHours = 3;
 const long RetrySleepSeconds = 60 * 60;
 long StartTime = 0;
 long SleepTimer = 0;
@@ -85,6 +88,120 @@ long Delta = 30; // ESP32 RTC speed compensation
 
 GFXfont currentFont;
 uint8_t *framebuffer;
+
+float ReadBatteryVoltage()
+{
+#if CONFIG_IDF_TARGET_ESP32
+    const uint8_t pin = 36;
+#else
+    const uint8_t pin = 14;
+#endif
+    analogSetPinAttenuation(pin, ADC_11db);
+    esp_adc_cal_characteristics_t adc_chars;
+    esp_adc_cal_value_t calibration = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
+    float vref = calibration == ESP_ADC_CAL_VAL_EFUSE_VREF ? adc_chars.vref : 1100.0f;
+    uint32_t raw = 0;
+    for (int sample = 0; sample < 8; ++sample)
+    {
+        raw += analogRead(pin);
+        delay(2);
+    }
+    uint32_t averageRaw = raw / 8;
+    float voltage = averageRaw / 4096.0f * 6.566f * (vref / 1000.0f);
+    Serial.printf("Battery ADC raw %u -> %.2f V\n", averageRaw, voltage);
+    return voltage >= 1.0f && voltage <= 5.0f ? voltage : 0.0f;
+}
+
+int BatteryUpdateInterval(float voltage)
+{
+    if (!(voltage >= 1.0f && voltage <= 5.0f))
+        return 3;
+    if (voltage >= 4.15f)
+        return 3;
+    if (voltage >= 3.95f)
+        return 6;
+    if (voltage >= 3.75f)
+        return 12;
+    return 24;
+}
+
+uint8_t BatteryPercentage(float voltage)
+{
+    if (voltage >= 4.20f)
+        return 100;
+    if (voltage <= 3.50f)
+        return 0;
+    float percentage = 2836.9625f * powf(voltage, 4) - 43987.4889f * powf(voltage, 3) +
+                       255233.8134f * powf(voltage, 2) - 656689.7123f * voltage + 632041.7303f;
+    return (uint8_t)constrain((int)lroundf(percentage), 0, 100);
+}
+
+void UpdateBatteryLifeEstimate(time_t now)
+{
+    if (BatteryVoltage < 1.0f || now < 1600000000)
+        return;
+
+    Preferences prefs;
+    if (!prefs.begin("battlife", false))
+        return;
+    float anchorPercent = prefs.getFloat("anchor_pct", -1.0f);
+    time_t anchorTime = (time_t)prefs.getULong64("anchor_time", 0);
+    float drainPercentPerDay = prefs.getFloat("drain_rate", 0.0f);
+    float percent = BatteryPercentage(BatteryVoltage);
+    bool save = false;
+
+    if (anchorPercent < 0.0f || anchorPercent > 100.0f || anchorTime == 0 || now <= anchorTime || now - anchorTime > 30 * 86400)
+    {
+        anchorPercent = percent;
+        anchorTime = now;
+        drainPercentPerDay = 0.0f;
+        save = true;
+    }
+    else if (percent >= anchorPercent + 5.0f)
+    {
+        anchorPercent = percent;
+        anchorTime = now;
+        drainPercentPerDay = 0.0f;
+        save = true;
+    }
+    else if (anchorPercent - percent >= 3.0f && now - anchorTime >= 86400)
+    {
+        float observedRate = (anchorPercent - percent) * 86400.0f / difftime(now, anchorTime);
+        drainPercentPerDay = drainPercentPerDay > 0.0f ? (drainPercentPerDay + observedRate) / 2.0f : observedRate;
+        anchorPercent = percent;
+        anchorTime = now;
+        save = true;
+    }
+
+    if (save)
+    {
+        prefs.putFloat("anchor_pct", anchorPercent);
+        prefs.putULong64("anchor_time", (uint64_t)anchorTime);
+        prefs.putFloat("drain_rate", drainPercentPerDay);
+    }
+    if (drainPercentPerDay > 0.0f)
+    {
+        double seconds = percent * 86400.0 / drainPercentPerDay;
+        const double maxSeconds = (99 * 24 * 60 + 23 * 60 + 59) * 60.0;
+        BatteryLifeEstimateSeconds = (int64_t)constrain(seconds, 0.0, maxSeconds);
+    }
+    prefs.end();
+}
+
+String FormatBatteryLifeEstimate()
+{
+    if (BatteryLifeEstimateSeconds < 0)
+        return "--d--:--";
+
+    uint64_t minutes = BatteryLifeEstimateSeconds / 60;
+    const uint64_t maxMinutes = 99 * 24 * 60 + 23 * 60 + 59;
+    if (minutes > maxMinutes)
+        minutes = maxMinutes;
+    char estimate[10];
+    snprintf(estimate, sizeof(estimate), "%02ud%02u:%02u",
+             (unsigned)(minutes / (24 * 60)), (unsigned)(minutes / 60 % 24), (unsigned)(minutes % 60));
+    return String(estimate);
+}
 
 bool IsScheduledUpdate()
 {
@@ -234,7 +351,13 @@ void setup()
         ntpServer = json1["ntp"]["server"].as<String>();
         Timezone = json1["ntp"]["timezone"].as<String>();
 
+        BatteryVoltage = ReadBatteryVoltage();
+        UpdateIntervalHours = BatteryUpdateInterval(BatteryVoltage);
+        Serial.printf("Battery estimate %.2f V; refresh interval %d h\n", BatteryVoltage, UpdateIntervalHours);
+
         bool timeSynced = StartWiFi() == WL_CONNECTED && SetupTime();
+        if (timeSynced)
+            UpdateBatteryLifeEstimate(time(nullptr));
         bool updateDue = timeSynced && IsScheduledUpdate();
         bool RxWeather = false;
         bool RxForecast = false;
@@ -506,7 +629,7 @@ void DisplayGeneralInfoSection()
     setFont(OpenSans10B);
     drawString(5, 2, City, LEFT);
     setFont(OpenSans8B);
-    drawString(500, 2, Date_str + "  @   " + Time_str, LEFT);
+    drawString(350, 2, Date_str + "  @   " + Time_str, LEFT);
 }
 
 void DisplayWeatherIcon(int x, int y)
@@ -875,7 +998,7 @@ void DisplayStatusSection(int x, int y, int rssi)
 {
     setFont(OpenSans8B);
     DrawRSSI(x + 305, y + 15, rssi);
-    DrawBattery(x + 150, y);
+    DrawBattery(x + 50, y);
 }
 
 void DrawRSSI(int x, int y, int rssi)
@@ -932,32 +1055,15 @@ boolean UpdateLocalTime()
 
 void DrawBattery(int x, int y)
 {
-    uint8_t percentage = 100;
-    esp_adc_cal_characteristics_t adc_chars;
-    esp_adc_cal_value_t val_type = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
-    if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF)
-    {
-        Serial.printf("eFuse Vref:%u mV", adc_chars.vref);
-        vref = adc_chars.vref;
-    }
-#if CONFIG_IDF_TARGET_ESP32
-    const uint8_t bat_adc_pin = 36;
-#else
-    const uint8_t bat_adc_pin = 14;
-#endif
-    float voltage = analogRead(bat_adc_pin) / 4096.0 * 6.566 * (vref / 1000.0);
+    float voltage = BatteryVoltage;
     if (voltage > 1)
     { // Only display if there is a valid reading
+        uint8_t percentage = BatteryPercentage(voltage);
         Serial.println("\nVoltage = " + String(voltage));
-        percentage = 2836.9625 * pow(voltage, 4) - 43987.4889 * pow(voltage, 3) + 255233.8134 * pow(voltage, 2) - 656689.7123 * voltage + 632041.7303;
-        if (voltage >= 4.20)
-            percentage = 100;
-        if (voltage <= 3.20)
-            percentage = 0; // orig 3.5
         drawRect(x + 25, y - 14, 40, 15, Black);
         fillRect(x + 65, y - 10, 4, 7, Black);
         fillRect(x + 27, y - 12, 36 * percentage / 100.0, 11, Black);
-        drawString(x + 85, y - 14, String(percentage) + "%  " + String(voltage, 1) + "v", LEFT);
+        drawString(x + 85, y - 14, String(percentage) + "%  " + String(voltage, 1) + "v ~" + FormatBatteryLifeEstimate(), LEFT);
     }
 }
 
