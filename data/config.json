@@ -1,19 +1,19 @@
 {
 	"WLAN": {
-		"ssid": "Your wifi ssid",
-		"password": "Your wifi password"
+		"ssid": "",
+		"password": ""
 	},
 	"OpenWeather": {
-		"apikey": "Your Open Weather key",
+		"apikey": "",
 		"server": "api.openweathermap.org",
-		"country": "CN",
-		"city": "shenzhen",
+		"country": "FR",
+		"city": "Monaco",
 		"hemisphere": "north",
 		"units": "M"
 	},
 	"ntp": {
-		"server": "0.asia.pool.ntp.org",
-		"timezone": ""
+		"server": "0.pool.ntp.org",
+		"timezone": "CET-1CEST,M3.5.0,M10.5.0/3"
 	},
 	"schedule_power": {
 		"on_time": "17:42",

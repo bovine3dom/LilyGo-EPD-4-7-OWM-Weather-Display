@@ -67,12 +67,14 @@ float humidity_readings[max_readings]    = {0};
 float rain_readings[max_readings]        = {0};
 float snow_readings[max_readings]        = {0};
 
-long SleepDuration = 60; // Sleep time in minutes, aligned to the nearest minute boundary, so if 30 will always update at 00 or 30 past the hour
-int  WakeupHour    = 8;  // Don't wakeup until after 07:00 to save battery power
-int  SleepHour     = 23; // Sleep after 23:00 to save battery power
-long StartTime     = 0;
-long SleepTimer    = 0;
-long Delta         = 30; // ESP32 rtc speed compensation, prevents display at xx:59:yy and then xx:00:yy (one minute later) to save power
+// Local-time refreshes: 06:00, 09:00, 12:00, 15:00, 18:00, and 21:00.
+const int WakeupHour = 6;
+const int SleepHour = 21;
+const int UpdateIntervalHours = 3;
+const long RetrySleepSeconds = 60 * 60;
+long StartTime = 0;
+long SleepTimer = 0;
+long Delta = 30; // ESP32 RTC speed compensation
 
 //fonts
 #include "opensans8b.h"
@@ -84,11 +86,42 @@ long Delta         = 30; // ESP32 rtc speed compensation, prevents display at xx
 GFXfont currentFont;
 uint8_t *framebuffer;
 
+bool IsScheduledUpdate()
+{
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER)
+        return true;
+    return CurrentHour >= WakeupHour && CurrentHour <= SleepHour &&
+           (CurrentHour - WakeupHour) % UpdateIntervalHours == 0 && CurrentMin <= 1;
+}
+
+long SecondsUntilNextUpdate(time_t now)
+{
+    struct tm nextUpdate;
+    localtime_r(&now, &nextUpdate);
+    int currentHour = nextUpdate.tm_hour;
+    int nextHour;
+    if (currentHour < WakeupHour)
+        nextHour = WakeupHour;
+    else if (currentHour >= SleepHour)
+        nextHour = 24 + WakeupHour;
+    else
+    {
+        nextHour = WakeupHour + ((currentHour - WakeupHour) / UpdateIntervalHours + 1) * UpdateIntervalHours;
+        if (nextHour > SleepHour)
+            nextHour = 24 + WakeupHour;
+    }
+    nextUpdate.tm_mday += nextHour / 24;
+    nextUpdate.tm_hour = nextHour % 24;
+    nextUpdate.tm_min = 0;
+    nextUpdate.tm_sec = 0;
+    nextUpdate.tm_isdst = -1;
+    return (long)difftime(mktime(&nextUpdate), now) + Delta;
+}
+
 void BeginSleep()
 {
     epd_poweroff_all();
-    UpdateLocalTime();
-    SleepTimer = (SleepDuration * 60 - ((CurrentMin % SleepDuration) * 60 + CurrentSec)) + Delta; //Some ESP32 have a RTC that is too fast to maintain accurate time, so add an offset
+    SleepTimer = UpdateLocalTime() ? SecondsUntilNextUpdate(time(nullptr)) : RetrySleepSeconds;
     esp_sleep_enable_timer_wakeup(SleepTimer * 1000000LL);                                        // in Secs, 1000000LL converts to Secs as unit = 1uSec
     Serial.println("Awake for : " + String((millis() - StartTime) / 1000.0, 3) + "-secs");
     Serial.println("Entering " + String(SleepTimer) + " (secs) of sleep time");
@@ -142,7 +175,10 @@ void InitialiseSystem()
 {
     StartTime = millis();
     Serial.begin(115200);
-    while (!Serial) ;
+    unsigned long serialWaitStart = millis();
+    unsigned long serialWaitLimit = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER ? 1000 : 10000;
+    while (!Serial && millis() - serialWaitStart < serialWaitLimit)
+        delay(10);
     Serial.println(String(__FILE__) + "\nStarting...");
     epd_init();
     framebuffer = (uint8_t *)ps_calloc(sizeof(uint8_t), EPD_WIDTH * EPD_HEIGHT / 2);
@@ -178,7 +214,7 @@ void setup()
     }
     else
     {
-        StaticJsonDocument<512> json1;
+        StaticJsonDocument<1024> json1;
         File configfile = SPIFFS.open("/config.json", "r");
         DeserializationError error = deserializeJson(json1, configfile);
         if (error)
@@ -198,42 +234,36 @@ void setup()
         ntpServer = json1["ntp"]["server"].as<String>();
         Timezone = json1["ntp"]["timezone"].as<String>();
 
-        // WakeupHour = strtok(json1["schedule_power"]["on_time"].as<const char *>());
-        // SleepHour  = json1["schedule_power"]["off_time"].as<String>();
-
-        if (StartWiFi() == WL_CONNECTED && SetupTime() == true)
+        bool timeSynced = StartWiFi() == WL_CONNECTED && SetupTime();
+        bool updateDue = timeSynced && IsScheduledUpdate();
+        bool RxWeather = false;
+        bool RxForecast = false;
+        if (updateDue)
         {
-            // bool WakeUp = false;
-            // if (WakeupHour > SleepHour)
-            //     WakeUp = (CurrentHour >= WakeupHour || CurrentHour <= SleepHour);
-            // else
-            //     WakeUp = (CurrentHour >= WakeupHour && CurrentHour <= SleepHour);
-            // if (WakeUp)
-            // {
-                byte Attempts = 1;
-                bool RxWeather = false;
-                bool RxForecast = false;
-                WiFiClient client; // wifi client object
-                while ((RxWeather == false || RxForecast == false) && Attempts <= 2)
-                { // Try up-to 2 time for Weather and Forecast data
-                    if (RxWeather == false)
-                        RxWeather = obtainWeatherData(client, "weather");
-                    if (RxForecast == false)
-                        RxForecast = obtainWeatherData(client, "forecast");
-                    Attempts++;
-                }
-                Serial.println("Received all weather data...");
-                if (RxWeather && RxForecast)
-                {                       // Only if received both Weather or Forecast proceed
-                    StopWiFi();         // Reduces power consumption
-                    epd_poweron();      // Switch on EPD display
-                    epd_clear();        // Clear the screen
-                    DisplayWeather();   // Display the weather data
-                    edp_update();       // Update the display to show the information
-                    epd_poweroff_all(); // Switch off all power to EPD
-                }
-            // }
+            byte Attempts = 1;
+            WiFiClient client;
+            while ((!RxWeather || !RxForecast) && Attempts <= 2)
+            {
+                if (!RxWeather)
+                    RxWeather = obtainWeatherData(client, "weather");
+                if (!RxForecast)
+                    RxForecast = obtainWeatherData(client, "forecast");
+                Attempts++;
+            }
         }
+        StopWiFi();
+        if (updateDue && RxWeather && RxForecast)
+        {
+            Serial.println("Received all weather data...");
+            epd_poweron();
+            epd_clear();
+            DisplayWeather();
+            edp_update();
+        }
+        else if (updateDue)
+            Serial.println("Weather update failed; keeping existing display");
+        else if (timeSynced)
+            Serial.println("Outside scheduled update times");
         BeginSleep();
     }
 }
@@ -377,6 +407,7 @@ bool obtainWeatherData(WiFiClient &client, const String &RequestType)
     client.stop(); // close connection before sending a new request
     HTTPClient http;
     String uri = "/data/2.5/" + RequestType + "?q=" + City + "," + Country + "&APPID=" + apikey + "&mode=json&units=" + units + "&lang=" + Language;
+    // String uri = "/data/2.5/" + RequestType + "?id" + ID + "&APPID=" + apikey + "&mode=json&units=" + units + "&lang=" + Language; // Nice was getting geocoded to the mountains, lol
     if (RequestType != "weather")
     {
         uri += "&cnt=" + String(max_readings);
@@ -758,7 +789,7 @@ void DisplayForecastSection(int x, int y)
     int gy = (SCREEN_HEIGHT - gheight - 30);
     int gap = gwidth + gx;
     // (x,y,width,height,MinValue, MaxValue, Title, Data Array, AutoScale, ChartMode)
-    DrawGraph(gx + 0 * gap, gy, gwidth, gheight, 900, 1050, Units == "M" ? TXT_PRESSURE_HPA : TXT_PRESSURE_IN, pressure_readings, max_readings, autoscale_on, barchart_off);
+    DrawGraph(gx + 0 * gap, gy, gwidth, gheight, 900, 1050, Units == "M" ? TXT_PRESSURE_HPA : TXT_PRESSURE_IN, pressure_readings, max_readings, autoscale_on, barchart_off); // TODO: swap this for wave height or visibility
     DrawGraph(gx + 1 * gap, gy, gwidth, gheight, 10, 30, Units == "M" ? TXT_TEMPERATURE_C : TXT_TEMPERATURE_F, temperature_readings, max_readings, autoscale_on, barchart_off);
     DrawGraph(gx + 2 * gap, gy, gwidth, gheight, 0, 100, TXT_HUMIDITY_PERCENT, humidity_readings, max_readings, autoscale_off, barchart_off);
     if (SumOfPrecip(rain_readings, max_readings) >= SumOfPrecip(snow_readings, max_readings))
