@@ -23,7 +23,6 @@
 #include "forecast_record.h"
 #include "partial_display.h"
 #include "lang.h"
-#include "web.h"
 
 #define SCREEN_WIDTH EPD_WIDTH
 #define SCREEN_HEIGHT EPD_HEIGHT
@@ -330,33 +329,27 @@ void loop()
     delay(1000);
 }
 
-#if T5_47_PLUS_V2
-#define USR_BUTTON 21
-#elif CONFIG_IDF_TARGET_ESP32
-#define USR_BUTTON 35
-#elif CONFIG_IDF_TARGET_ESP32S3
-#define USR_BUTTON 21
-#endif
-
 void setup()
 {
     InitialiseSystem();
 
-    SPIFFS.begin();
-    pinMode(USR_BUTTON, INPUT_PULLUP);
-
-    if ( !digitalRead(USR_BUTTON) || !SPIFFS.exists("/config.json") )
+    if (!SPIFFS.begin() || !SPIFFS.exists("/config.json"))
     {
-        setupWEB();
+        Serial.println("Configuration unavailable; upload the SPIFFS image");
+        BeginSleep();
     }
     else
     {
         StaticJsonDocument<1024> json1;
         File configfile = SPIFFS.open("/config.json", "r");
         DeserializationError error = deserializeJson(json1, configfile);
-        if (error)
-            Serial.println(F("Failed to read file, using default configuration"));
         configfile.close();
+        if (error)
+        {
+            Serial.println("Invalid configuration; upload the SPIFFS image");
+            BeginSleep();
+            return;
+        }
 
         ssid = json1["WLAN"]["ssid"].as<String>();
         password = json1["WLAN"]["password"].as<String>();

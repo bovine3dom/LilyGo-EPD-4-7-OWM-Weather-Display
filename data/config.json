@@ -14,9 +14,5 @@
 	"ntp": {
 		"server": "0.pool.ntp.org",
 		"timezone": "CET-1CEST,M3.5.0,M10.5.0/3"
-	},
-	"schedule_power": {
-		"on_time": "17:42",
-		"off_time": "17:42"
 	}
 }
