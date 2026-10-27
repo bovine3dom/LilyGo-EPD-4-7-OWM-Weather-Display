@@ -167,7 +167,8 @@ bool UpdatePartialDisplay(const uint8_t *framebuffer, bool morningRefresh)
         return false;
     }
     auto cause = esp_sleep_get_wakeup_cause();
-    bool valid = (updatedThisWake || cause == ESP_SLEEP_WAKEUP_TIMER || cause == ESP_SLEEP_WAKEUP_EXT0) &&
+    bool valid = (updatedThisWake || cause == ESP_SLEEP_WAKEUP_TIMER || cause == ESP_SLEEP_WAKEUP_EXT0 ||
+                  cause == ESP_SLEEP_WAKEUP_EXT1) &&
                  prefs.getBool("valid", false) && loadBitmap(ImagePath, previous, prefs.getUInt("hash", 0));
     unsigned partials = valid ? prefs.getUInt("partials", 0) : 0;
     time_t now = time(nullptr);

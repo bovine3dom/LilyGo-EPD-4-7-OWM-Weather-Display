@@ -19,12 +19,13 @@ harness = r'''
 #include <ctime>
 using byte = unsigned char;
 #define EPDPARTIAL 1
+#define T5_47_PLUS_V2 1
 #define WL_CONNECTED 1
 time_t now = 1700000000;
 time_t mockTime(time_t*) { return now; }
 #define time mockTime
-int fakeCalls = 0, apiCalls = 0, renders = 0, wifiCalls = 0, sleeps = 0, successes = 0;
-bool tramActive = false, displayOk = true;
+int fakeCalls = 0, apiCalls = 0, renders = 0, wifiCalls = 0, sleeps = 0, successes = 0, warnings = 0;
+bool tramActive = false, displayOk = true, clockAvailable = true, wifiOk = true;
 uint64_t lastSlot = 0;
 float BatteryVoltage;
 int UpdateIntervalHours, CurrentHour = 12, CurrentMin = 0;
@@ -38,9 +39,11 @@ bool RunTramPage() { return tramActive; }
 void BeginSleep() { ++sleeps; }
 float ReadBatteryVoltage() { return 4.2; }
 int BatteryUpdateInterval(float) { return 1; }
-bool UpdateLocalTime() { return true; }
-int StartWiFi() { ++wifiCalls; return WL_CONNECTED; }
-bool SetupTime() { return true; }
+bool UpdateLocalTime() { return clockAvailable; }
+int StartWiFi() { ++wifiCalls; return wifiOk ? WL_CONNECTED : 0; }
+bool SetupTime() { return wifiOk; }
+bool LoadDisplayedImage(uint8_t*) { return true; }
+void DrawWiFiStatus() { ++warnings; }
 void UpdateBatteryLifeEstimate(time_t) {}
 bool IsScheduledUpdate() { return true; }
 bool ClaimWeatherAttempt(time_t value) { uint64_t slot = value / 3600; if (slot == lastSlot) return false; lastSlot = slot; return true; }
@@ -81,6 +84,8 @@ int main() {
 #else
     assert(apiCalls == 4);
 #endif
+    tramActive = false; clockAvailable = false; wifiOk = false; setup();
+    assert(warnings == 1);
 }
 '''
 with tempfile.TemporaryDirectory() as directory:

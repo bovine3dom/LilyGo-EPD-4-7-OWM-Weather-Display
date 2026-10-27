@@ -25,6 +25,8 @@
 #include "forecast_record.h"
 #include "partial_display.h"
 #include "transitous.h"
+#include "rail.h"
+#include "button_icons.h"
 #include "lang.h"
 
 #define SCREEN_WIDTH EPD_WIDTH
@@ -59,6 +61,7 @@ boolean SmallIcon = false;
 String Time_str = "--:--:--";
 String Date_str = "-- --- ----";
 int wifi_signal, CurrentHour = 0, CurrentMin = 0, CurrentSec = 0, EventCnt = 0;
+RTC_DATA_ATTR bool WiFiConnectionFailed = false;
 float BatteryVoltage = 0.0f;
 int64_t BatteryLifeEstimateSeconds = -1;
 //################ PROGRAM VARIABLES and OBJECTS ##########################################
@@ -79,12 +82,17 @@ const int WakeupHour = 8;
 const int SleepHour = 21;
 int UpdateIntervalHours = 1;
 bool AwakeTramButtonPressed = false;
+#if T5_47_PLUS_V2
+bool AwakeRailButtonPressed = false;
+uint64_t ButtonWakePins = 0;
+#endif
 const long RetrySleepSeconds = 60 * 60;
 long StartTime = 0;
 long SleepTimer = 0;
 long Delta = 30; // ESP32 RTC speed compensation
 
 #include "fonts/spleen.h"
+#include "fonts/battery_9x18.h"
 
 GFXfont currentFont;
 uint8_t *framebuffer;
@@ -302,15 +310,25 @@ void BeginSleep()
     }
 #if T5_47_PLUS_V2
     pinMode(21, INPUT_PULLUP);
+    pinMode(0, INPUT_PULLUP); // GPIO0 is the display strobe; switch only after power-off.
     unsigned long releaseStart = millis();
-    while (!digitalRead(21) && millis() - releaseStart < 5000)
+    while ((!digitalRead(21) || !digitalRead(0)) && millis() - releaseStart < 5000)
         delay(10);
     if (digitalRead(21))
     {
         rtc_gpio_pullup_en(GPIO_NUM_21);
         rtc_gpio_pulldown_dis(GPIO_NUM_21);
-        esp_sleep_enable_ext0_wakeup(GPIO_NUM_21, 0);
     }
+    uint64_t wakePins = digitalRead(21) ? (1ULL << 21) : 0;
+    if (digitalRead(0))
+    {
+        rtc_gpio_pullup_en(GPIO_NUM_0);
+        rtc_gpio_pulldown_dis(GPIO_NUM_0);
+        wakePins |= 1ULL;
+    }
+    // IDF 4.4 calls mode 0 ALL_LOW; on the S3 it wakes on any low pin.
+    if (wakePins) esp_sleep_enable_ext1_wakeup(wakePins, ESP_EXT1_WAKEUP_ALL_LOW);
+    if (wakePins != ((1ULL << 21) | 1ULL)) SleepTimer = min(SleepTimer, 60L);
 #endif
     esp_sleep_enable_timer_wakeup(SleepTimer * 1000000LL);                                        // in Secs, 1000000LL converts to Secs as unit = 1uSec
     Serial.println("Awake for : " + String((millis() - StartTime) / 1000.0, 3) + "-secs");
@@ -345,14 +363,16 @@ uint8_t StartWiFi()
         delay(500);
         WiFi.begin(const_cast<const char *>(ssid.c_str()), const_cast<const char *>(password.c_str()));
     }
-    if (WiFi.status() == WL_CONNECTED)
+    uint8_t status = WiFi.status();
+    WiFiConnectionFailed = status != WL_CONNECTED;
+    if (!WiFiConnectionFailed)
     {
         wifi_signal = WiFi.RSSI(); // Get Wifi Signal strength now, because the WiFi will be turned off to save power!
         Serial.println("WiFi connected at: " + WiFi.localIP().toString());
     }
     else
         Serial.println("WiFi connection *** FAILED ***");
-    return WiFi.status();
+    return status;
 }
 
 void StopWiFi()
@@ -366,32 +386,80 @@ bool PollTramButton()
 {
 #if T5_47_PLUS_V2
     if (!digitalRead(21)) AwakeTramButtonPressed = true;
-#endif
+    if (!digitalRead(0)) AwakeRailButtonPressed = true;
+    return AwakeTramButtonPressed || AwakeRailButtonPressed;
+#else
     return AwakeTramButtonPressed;
+#endif
 }
+
+#if T5_47_PLUS_V2
+void WaitForRailButtonRelease()
+{
+    unsigned long start = millis();
+    while (!digitalRead(0) && millis() - start < 5000) delay(10);
+    if (!digitalRead(0))
+    {
+        // Avoid driving the display strobe against a held button.
+        pinMode(21, INPUT_PULLUP);
+        if (digitalRead(21)) esp_sleep_enable_ext1_wakeup(1ULL << 21, ESP_EXT1_WAKEUP_ALL_LOW);
+        esp_sleep_enable_timer_wakeup((DEBUG_SERIAL_WAKE_SECONDS > 0 ? DEBUG_SERIAL_WAKE_SECONDS : 60) * 1000000LL);
+        esp_deep_sleep_start();
+    }
+}
+#endif
 
 void InitialiseSystem()
 {
     StartTime = millis();
 #if T5_47_PLUS_V2
+    ButtonWakePins = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1 ? esp_sleep_get_ext1_wakeup_status() : 0;
+    rtc_gpio_deinit(GPIO_NUM_0);
+    rtc_gpio_deinit(GPIO_NUM_21);
+    pinMode(0, INPUT_PULLUP);
     pinMode(21, INPUT_PULLUP);
+    PollTramButton();
+    WaitForRailButtonRelease();
+#if DEBUG_SERIAL_WAKE_SECONDS > 0
+    uint64_t wakePins = ButtonWakePins;
+    Preferences buttonTest;
+    if (buttonTest.begin("button-test", false))
+    {
+        if (wakePins) buttonTest.putULong64("last-pins", wakePins);
+        wakePins = buttonTest.getULong64("last-pins", 0);
+        buttonTest.end();
+    }
+#endif
 #endif
     Serial.begin(115200);
-    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT0)
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT0
+#if T5_47_PLUS_V2
+        && esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1
+#endif
+       )
     {
-        unsigned long serialWaitStart = millis();
-        while (!Serial && millis() - serialWaitStart < 1000 && !PollTramButton())
-            delay(10);
         unsigned long window = esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER ? 10000 :
                                (DEBUG_SERIAL_WAKE_SECONDS > 0 ? 5000 : 0);
-        unsigned long windowStart = millis();
-        while (millis() - windowStart < window && !PollTramButton())
-            delay(10);
+        if (window)
+        {
+            unsigned long serialWaitStart = millis();
+            while (!Serial && millis() - serialWaitStart < 1000 && !PollTramButton())
+                delay(10);
+            unsigned long windowStart = millis();
+            while (millis() - windowStart < window && !PollTramButton())
+                delay(10);
+        }
     }
+#if T5_47_PLUS_V2
+    WaitForRailButtonRelease();
+#endif
     Serial.println(String(__FILE__) + "\nStarting...");
     Serial.printf("Reset reason %d; wake cause %d; fake weather %d; debug wake %d s\n",
                   (int)esp_reset_reason(), (int)esp_sleep_get_wakeup_cause(),
                   DEBUG_FAKE_WEATHER, DEBUG_SERIAL_WAKE_SECONDS);
+#if T5_47_PLUS_V2 && DEBUG_SERIAL_WAKE_SECONDS > 0
+    Serial.printf("Button test: last wake pins 0x%llx\n", wakePins);
+#endif
 #if !EPDPARTIAL
     epd_init();
 #endif
@@ -407,15 +475,33 @@ void loop()
     delay(1000);
 }
 
-String FitTramDestination(const char *destination)
+void DrawButtonHints(ButtonHintPage page)
+{
+#if T5_47_PLUS_V2
+    const int centers[] = {601, 675, 760};
+    const int top = page == WeatherPage ? 16 : 22;
+    for (int icon = 0; icon < 3; ++icon)
+    {
+        int glyph = (icon == 0 && page == TramPage) || (icon == 1 && page == RailPage) ? 3 : icon;
+        int offset = icon == 2 ? 8 : 13;
+        fillTriangle(centers[icon], top, centers[icon] - 6, top + 12, centers[icon] + 6, top + 12, Black);
+        for (int y = 0; y < 20; ++y)
+            for (int x = 0; x < 30; ++x)
+                if (ButtonIcons[glyph][y][x] == '#')
+                    drawPixel(centers[icon] + offset + x, top - 3 + y, Black);
+    }
+#endif
+}
+
+String FitTramDestination(const char *destination, int limit = 20)
 {
     String text(destination);
     int count = 0, truncateAt = 0;
     for (unsigned i = 0; i < text.length(); ++i)
         if ((static_cast<uint8_t>(text[i]) & 0xC0) != 0x80)
         {
-            if (++count == 18) truncateAt = i;
-            if (count == 21) return text.substring(0, truncateAt) + "...";
+            if (++count == limit - 2) truncateAt = i;
+            if (count == limit + 1) return text.substring(0, truncateAt) + "...";
         }
     return text;
 }
@@ -423,6 +509,7 @@ String FitTramDestination(const char *destination)
 void DisplayTramBoard(const TramDeparture *rows, size_t count, time_t updatedAt, bool ok)
 {
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    DrawButtonHints(TramPage);
     setFont(Spleen24Bold);
     drawString(20, 16, TRAM_STOP_TITLE, LEFT);
     char updated[6] = "--:--";
@@ -451,6 +538,38 @@ void DisplayTramBoard(const TramDeparture *rows, size_t count, time_t updatedAt,
     }
 }
 
+void DisplayRailBoard(const RailDeparture *rows, size_t count, time_t updatedAt, bool ok)
+{
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    DrawButtonHints(RailPage);
+    setFont(Spleen24Bold);
+    drawString(20, 16, String(RAIL_STATION_TITLE) + " - DEPARTURES", LEFT);
+    char updated[6] = "--:--";
+    if (updatedAt)
+    {
+        struct tm localTime;
+        localtime_r(&updatedAt, &localTime);
+        strftime(updated, sizeof(updated), "%H:%M", &localTime);
+    }
+    setFont(Spleen24);
+    drawString(324, 16, "Scheduled", LEFT);
+    drawString(445, 16, "Expected", LEFT);
+    drawString(940, 16, updated, RIGHT);
+    drawFastHLine(20, 55, 920, Black);
+    if (!ok || !count) drawString(24, 73, ok ? "No departures found" : "Departures unavailable", LEFT);
+    for (size_t i = 0; i < count; ++i)
+    {
+        int y = 73 + i * 48;
+        drawString(24, y, FitTramDestination(rows[i].destination, 24), LEFT);
+        drawString(324, y, rows[i].scheduled, LEFT);
+        drawString(445, y, rows[i].expected, LEFT);
+        String platform(rows[i].platform);
+        if (platform.length() > 30) platform = platform.substring(0, 27) + "...";
+        drawString(570, y, platform, LEFT);
+        if (i + 1 < count) fillRect(20, y + 35, 920, 2, LightGrey);
+    }
+}
+
 bool DisplayLoading(const char *message)
 {
     if (!LoadDisplayedImage(framebuffer))
@@ -464,8 +583,11 @@ bool DisplayLoading(const char *message)
 
 bool RestoreWeatherPage(Preferences &page)
 {
-    if (!LoadWeatherImage(framebuffer) || !UpdatePartialDisplay(framebuffer, false))
-        return false;
+    if (!LoadWeatherImage(framebuffer)) return false;
+#if T5_47_PLUS_V2
+    DrawWiFiStatus();
+#endif
+    if (!UpdatePartialDisplay(framebuffer, false)) return false;
     if (page.putBool("weather_wake", true) != 1 || page.putBool("dirty", false) != 1) return false;
     Serial.println("Weather image restored");
     return true;
@@ -477,20 +599,41 @@ bool RunTramPage()
     Preferences page;
     if (!page.begin("tram-test", false)) return true;
     bool active = page.getBool("active", false);
+    bool rail = page.getBool("rail", false);
     bool button = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 || AwakeTramButtonPressed;
+    bool railButton = false;
+#if T5_47_PLUS_V2
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1)
+    {
+        button = button || (ButtonWakePins & (1ULL << 21));
+        railButton = ButtonWakePins & 1;
+    }
+    railButton = railButton || AwakeRailButtonPressed;
+    AwakeRailButtonPressed = false;
+#endif
     AwakeTramButtonPressed = false;
+    bool pressed = button || railButton;
+    bool targetRail = railButton;
     if (!active && page.getBool("dirty", false))
     {
         if (!RestoreWeatherPage(page))
         {
             Serial.println("Cannot restore saved weather image");
-            if (button) DisplayLoading("Weather unavailable");
+            if (pressed) DisplayLoading("Weather unavailable");
             page.end();
             return true;
         }
-        if (!button) { page.end(); return true; }
+        if (!pressed) { page.end(); return true; }
     }
-    if (button && active)
+    if (pressed && active && targetRail != rail)
+    {
+        if (page.putBool("dirty", true) != 1 || page.putBool("rail", targetRail) != 1 ||
+            page.putULong64("end", 0) != sizeof(uint64_t) || page.putULong64("next", 0) != sizeof(uint64_t))
+        { page.end(); return true; }
+        rail = targetRail;
+        DisplayLoading(rail ? "Loading trains..." : "Loading trams...");
+    }
+    else if (pressed && active)
     {
         if (page.putBool("dirty", true) == 1 && page.putBool("active", false) == 1)
         {
@@ -500,7 +643,7 @@ bool RunTramPage()
         page.end();
         return true;
     }
-    if (button && !active)
+    if (pressed && !active)
     {
         if (!SaveWeatherImage() && !LoadWeatherImage(framebuffer))
         {
@@ -512,14 +655,16 @@ bool RunTramPage()
         }
         if (page.putULong64("end", 0) != sizeof(uint64_t) ||
             page.putULong64("next", 0) != sizeof(uint64_t) ||
-            page.putBool("dirty", true) != 1 || page.putBool("active", true) != 1)
+            page.putBool("dirty", true) != 1 || page.putBool("rail", targetRail) != 1 ||
+            page.putBool("active", true) != 1)
         {
             Serial.println("Cannot start tram page");
             page.end();
             return true;
         }
         active = true;
-        DisplayLoading("Loading trams...");
+        rail = targetRail;
+        DisplayLoading(rail ? "Loading trains..." : "Loading trams...");
     }
     if (!active)
     {
@@ -555,14 +700,27 @@ bool RunTramPage()
              page.putULong64("next", now + 60) == sizeof(uint64_t) &&
              page.putBool("dirty", true) == 1)
     {
-        TramDeparture *rows = static_cast<TramDeparture *>(ps_malloc(32 * sizeof(TramDeparture)));
         size_t count = 0;
-        bool ok = rows && StartWiFi() == WL_CONNECTED && FetchTransitous(rows, 32, count);
-        StopWiFi();
-        DisplayTramBoard(rows, count, ok ? time(nullptr) : 0, ok);
-        free(rows);
+        bool connected = StartWiFi() == WL_CONNECTED;
+        bool ok;
+        if (rail)
+        {
+            RailDeparture *rows = static_cast<RailDeparture *>(ps_malloc(10 * sizeof(RailDeparture)));
+            ok = rows && connected && FetchRail(rows, 10, count);
+            StopWiFi();
+            DisplayRailBoard(rows, count, ok ? time(nullptr) : 0, ok);
+            free(rows);
+        }
+        else
+        {
+            TramDeparture *rows = static_cast<TramDeparture *>(ps_malloc(32 * sizeof(TramDeparture)));
+            ok = rows && connected && FetchTransitous(rows, 32, count);
+            StopWiFi();
+            DisplayTramBoard(rows, count, ok ? time(nullptr) : 0, ok);
+            free(rows);
+        }
         if (UpdatePartialDisplay(framebuffer, false)) page.putBool("dirty", false);
-        Serial.printf("Transitous: %s, %u departures\n", ok ? "OK" : "failed", (unsigned)count);
+        Serial.printf("%s: %s, %u departures\n", rail ? "Rail" : "Transitous", ok ? "OK" : "failed", (unsigned)count);
     }
     page.end();
     return true;
@@ -602,7 +760,7 @@ uint32_t WeatherSlot(time_t now)
 
 const char *WeatherScheduleNamespace()
 {
-    return DEBUG_FAKE_WEATHER ? "weather-test" : "weather-sched";
+    return DEBUG_FAKE_WEATHER ? "weather-test11" : "weather-sched";
 }
 
 bool ClaimWeatherAttempt(time_t now)
@@ -747,6 +905,13 @@ void setup()
         Serial.println("Weather update failed; keeping existing display");
     else if (timeSynced)
         Serial.println("Outside scheduled update times");
+#if T5_47_PLUS_V2 && EPDPARTIAL
+    if (wifiUsed && !wifiConnected && LoadDisplayedImage(framebuffer))
+    {
+        DrawWiFiStatus();
+        UpdatePartialDisplay(framebuffer, false);
+    }
+#endif
     BeginSleep();
 }
 void Convert_Readings_to_Imperial()
@@ -972,6 +1137,7 @@ double NormalizedMoonPhase(int d, int m, int y)
 
 void DisplayWeather()
 {                                               // 4.7" e-paper display is 960x540 resolution
+    DrawButtonHints(WeatherPage);
     DisplayStatusSection(600, 20, wifi_signal); // Wi-Fi signal strength and Battery voltage
     DisplayGeneralInfoSection();                // Top line of the display
     DisplayDisplayWindSection(137, 150, WxConditions[0].Winddir, WxConditions[0].Windspeed, 100);
@@ -1353,9 +1519,26 @@ void DrawPressureAndTrend(int x, int y, float pressure, String slope)
 
 void DisplayStatusSection(int x, int y, int rssi)
 {
+#if T5_47_PLUS_V2
+    DrawWiFiStatus();
+    DrawBattery(x + 175, y + 4);
+#else
     setFont(Spleen24);
     DrawRSSI(x + 305, y + 15, rssi);
     DrawBattery(x - 45, y + 4);
+#endif
+}
+
+void DrawWiFiStatus()
+{
+    fillRect(544, 9, 29, 25, White);
+    if (!WiFiConnectionFailed) return;
+    drawLine(548, 16, 558, 11, Black);
+    drawLine(558, 11, 568, 16, Black);
+    drawLine(552, 21, 558, 18, Black);
+    drawLine(558, 18, 564, 21, Black);
+    fillCircle(558, 27, 2, Black);
+    drawLine(548, 10, 568, 30, Black);
 }
 
 void DrawRSSI(int x, int y, int rssi)
@@ -1417,10 +1600,18 @@ void DrawBattery(int x, int y)
     { // Only display if there is a valid reading
         uint8_t percentage = BatteryPercentage(voltage);
         Serial.println("\nVoltage = " + String(voltage));
+#if T5_47_PLUS_V2
+        drawRect(x + 25, y - 9, 25, 15, Black);
+        fillRect(x + 50, y - 5, 3, 7, Black);
+        fillRect(x + 27, y - 7, 21 * percentage / 100.0, 11, Black);
+        setFont(Battery18);
+        drawString(x + 58, y - 11, String(voltage, 1) + "v " + FormatBatteryLifeEstimate(), LEFT);
+#else
         drawRect(x + 25, y - 5, 40, 15, Black);
         fillRect(x + 65, y - 1, 4, 7, Black);
         fillRect(x + 27, y - 3, 36 * percentage / 100.0, 11, Black);
         drawString(x + 85, y - 14, String(percentage) + "%  " + String(voltage, 1) + "v ~" + FormatBatteryLifeEstimate(), LEFT);
+#endif
     }
 }
 

@@ -26,15 +26,20 @@ harness = r'''
 #include <string>
 using String = std::string;
 std::map<std::string, uint64_t> values;
-int cause = 0, fetches = 0, restores = 0, trams = 0, weather = 0, errors = 0, boards = 0;
+int cause = 0, fetches = 0, railFetches = 0, restores = 0, trams = 0, trains = 0, weather = 0, errors = 0, boards = 0;
 bool saveOk = true, restoreOk = true, displayOk = true, fetchOk = true;
-bool AwakeTramButtonPressed = false;
+bool AwakeTramButtonPressed = false, AwakeRailButtonPressed = false;
 time_t now = 1700000000;
 uint8_t pixels[1], *framebuffer = pixels;
 #define EPDPARTIAL 1
+#define T5_47_PLUS_V2 1
 #define ESP_SLEEP_WAKEUP_EXT0 2
+#define ESP_SLEEP_WAKEUP_EXT1 3
 #define WL_CONNECTED 1
+uint64_t ButtonWakePins = 0;
+uint64_t &wakePins = ButtonWakePins;
 int esp_sleep_get_wakeup_cause() { return cause; }
+uint64_t esp_sleep_get_ext1_wakeup_status() { return wakePins; }
 time_t mockTime(time_t *) { return now; }
 #define time mockTime
 struct Preferences {
@@ -48,12 +53,16 @@ struct Preferences {
 struct { void println(const char*) {} template<class... T> void printf(const char*, T...) {} } Serial;
 bool SaveWeatherImage() { return saveOk; }
 bool LoadWeatherImage(uint8_t*) { ++restores; return restoreOk; }
+void DrawWiFiStatus() {}
 bool UpdatePartialDisplay(uint8_t*, bool) { return displayOk; }
-bool DisplayLoading(const char *s) { if (std::string(s).find("trams") != std::string::npos) ++trams; else if (std::string(s).find("unavailable") != std::string::npos) ++errors; else ++weather; return displayOk; }
+bool DisplayLoading(const char *s) { if (std::string(s).find("trams") != std::string::npos) ++trams; else if (std::string(s).find("trains") != std::string::npos) ++trains; else if (std::string(s).find("unavailable") != std::string::npos) ++errors; else ++weather; return displayOk; }
 int StartWiFi() { return WL_CONNECTED; }
 bool SetupTime() { return true; }
 void StopWiFi() {}
 struct TramDeparture {};
+struct RailDeparture {};
+bool FetchRail(RailDeparture*, size_t capacity, size_t &count) { assert(capacity == 10); ++railFetches; count = 0; return fetchOk; }
+void DisplayRailBoard(const RailDeparture*, size_t, time_t, bool) { ++boards; }
 void *ps_malloc(size_t size) { return malloc(size); }
 bool FetchTransitous(TramDeparture*, size_t capacity, size_t &count) { assert(capacity == 32); ++fetches; count = 0; return fetchOk; }
 void DisplayTramBoard(const TramDeparture*, size_t, time_t, bool) { ++boards; }
@@ -61,7 +70,19 @@ void DisplayTramBoard(const TramDeparture*, size_t, time_t, bool) { ++boards; }
 harness += function("bool RestoreWeatherPage(") + "\n" + function("bool RunTramPage()")
 harness += r'''
 int main() {
-    cause = ESP_SLEEP_WAKEUP_EXT0;
+    cause = ESP_SLEEP_WAKEUP_EXT1; wakePins = 1;
+    RunTramPage(); assert(values["active"] && values["rail"] && railFetches == 1 && trains == 1);
+    wakePins = 1ULL << 21;
+    RunTramPage(); assert(values["active"] && !values["rail"] && fetches == 1);
+    wakePins = 1;
+    RunTramPage(); assert(values["active"] && values["rail"] && railFetches == 2);
+    RunTramPage(); assert(!values["active"] && values["weather_wake"]);
+    cause = 0; wakePins = 0; AwakeRailButtonPressed = true;
+    RunTramPage(); assert(values["active"] && values["rail"] && !AwakeRailButtonPressed);
+    cause = ESP_SLEEP_WAKEUP_EXT1; wakePins = 1; RunTramPage();
+    cause = 0; wakePins = 0; RunTramPage();
+    fetches = restores = trams = trains = weather = boards = 0;
+    cause = ESP_SLEEP_WAKEUP_EXT1; wakePins = 1ULL << 21;
     RunTramPage();
     assert(trams == 1 && fetches == 1 && boards == 1 && values["active"] && !values["dirty"]);
     assert(values["end"] == (uint64_t)now + 300 && values["next"] == (uint64_t)now + 60);
@@ -88,8 +109,10 @@ int main() {
 '''
 with tempfile.TemporaryDirectory() as directory:
     cpp = Path(directory) / "state.cpp"
-    exe = Path(directory) / "state"
     cpp.write_text(harness)
-    subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", str(cpp), "-o", str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    for wake in (0, 30):
+        exe = Path(directory) / f"state{wake}"
+        subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", f"-DDEBUG_SERIAL_WAKE_SECONDS={wake}",
+                        str(cpp), "-o", str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
 print("Tram state recovery tests passed")

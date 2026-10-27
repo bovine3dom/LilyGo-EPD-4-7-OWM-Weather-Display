@@ -26,6 +26,8 @@ struct TramGroup {
     size_t count;
 };
 
+bool ParseTransitTime(const char *value, time_t &timestamp);
+bool FormatTransitTime(time_t timestamp, char output[6]);
 bool FindTramStop(const char *json, size_t length, char *stopId, size_t capacity, const TramStop &target);
 bool IsTramStopResponse(const char *json, size_t length, const TramStop &target);
 bool EncodeTransitousId(const char *id, char *encoded, size_t capacity);

@@ -70,6 +70,7 @@ extern FS SPIFFS;
 #pragma once
 #define ESP_SLEEP_WAKEUP_TIMER 1
 #define ESP_SLEEP_WAKEUP_EXT0 2
+#define ESP_SLEEP_WAKEUP_EXT1 3
 extern int cause;
 inline int esp_sleep_get_wakeup_cause() { return cause; }
 ''',
@@ -154,8 +155,10 @@ int main() {
     fail_remove = false; gray[11] = 0;
     assert(UpdatePartialDisplay(gray.data(), false) && fulls == 7);
     assert(begins == 1 && ends == 0);
+    updatedThisWake = false; cause = ESP_SLEEP_WAKEUP_EXT1;
+    gray[12] = 0; assert(UpdatePartialDisplay(gray.data(), false) && fulls == 7);
     updatedThisWake = false; cause = 0; assert(UpdatePartialDisplay(gray.data(), false) && fulls == 8);
-    fail_invalidate = true; cause = ESP_SLEEP_WAKEUP_TIMER; gray[12] = 0;
+    fail_invalidate = true; cause = ESP_SLEEP_WAKEUP_TIMER; gray[13] = 0;
     int before = paints; assert(!UpdatePartialDisplay(gray.data(), false) && paints == before);
     PowerOffPartialDisplay();
     assert(ends == 1);

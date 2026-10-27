@@ -5,8 +5,7 @@
 #include <cstring>
 #include <ctime>
 
-namespace {
-bool parseTime(const char *value, time_t &timestamp)
+bool ParseTransitTime(const char *value, time_t &timestamp)
 {
     if (!value) return false;
     tm utc = {};
@@ -34,12 +33,13 @@ bool parseTime(const char *value, time_t &timestamp)
     return true;
 }
 
-bool formatTime(time_t timestamp, char output[6])
+bool FormatTransitTime(time_t timestamp, char output[6])
 {
     tm local;
     return localtime_r(&timestamp, &local) && strftime(output, 6, "%H:%M", &local) == 5;
 }
 
+namespace {
 bool isDesiredStop(JsonObjectConst place, const TramStop &target)
 {
     const char *name = place["name"] | "";
@@ -153,11 +153,11 @@ bool ParseTransitous(char *json, size_t length, TramDeparture *rows, size_t capa
         if (!line || !*line || !destination || !*destination || event["cancelled"] == true ||
             event["tripCancelled"] == true || place["cancelled"] == true) continue;
         time_t scheduled = 0, expected = 0;
-        bool hasSchedule = parseTime(place["scheduledDeparture"], scheduled);
+        bool hasSchedule = ParseTransitTime(place["scheduledDeparture"], scheduled);
         const char *reason = place["departureTimestampReason"] | "";
         bool predicted = event["realTime"] == true &&
                          (!strcmp(reason, "PREDICTED") || !strcmp(reason, "PROPAGATED") || !strcmp(reason, "OBSERVED")) &&
-                         parseTime(place["departure"], expected);
+                         ParseTransitTime(place["departure"], expected);
         if (!predicted && !hasSchedule) continue;
         time_t effective = predicted ? expected : scheduled;
         if (effective <= cutoffTime) continue;
@@ -166,12 +166,12 @@ bool ParseTransitous(char *json, size_t length, TramDeparture *rows, size_t capa
         if (position >= capacity) continue;
         TramDeparture row = {};
         row.effectiveTime = effective;
-        if (!hasSchedule || !formatTime(scheduled, row.scheduled))
+        if (!hasSchedule || !FormatTransitTime(scheduled, row.scheduled))
             snprintf(row.scheduled, sizeof(row.scheduled), "--:--");
         snprintf(row.line, sizeof(row.line), "%s", line);
         snprintf(row.destination, sizeof(row.destination), "%s", destination);
         if (predicted) {
-            if (!formatTime(expected, row.expected)) continue;
+            if (!FormatTransitTime(expected, row.expected)) continue;
         } else snprintf(row.expected, sizeof(row.expected), "--:--");
         if (count < capacity) ++count;
         for (size_t i = count - 1; i > position; --i) rows[i] = rows[i - 1];

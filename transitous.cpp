@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "transitous.h"
 #include "transitous_ca.h"
+#include "bounded_response.h"
 #include ".pio/private_config.h"
 #include <Arduino.h>
 #include <HTTPClient.h>
@@ -14,24 +15,6 @@ constexpr char DeparturesEndpoint[] = "https://api.transitous.org/api/v6/stoptim
 RTC_DATA_ATTR char cachedStopId[256] = {};
 RTC_DATA_ATTR time_t cachedStopUntil = 0;
 
-class ResponseBuffer : public Stream {
-public:
-    explicit ResponseBuffer(uint8_t *buffer) : data(buffer) {}
-    size_t write(uint8_t byte) override { return write(&byte, 1); }
-    size_t write(const uint8_t *bytes, size_t length) override {
-        if (length > MaxResponse - used) return 0;
-        memcpy(data + used, bytes, length);
-        used += length;
-        return length;
-    }
-    int available() override { return 0; }
-    int read() override { return -1; }
-    int peek() override { return -1; }
-    void flush() override {}
-    uint8_t *data;
-    size_t used = 0;
-};
-
 int RequestJson(const String &url, uint8_t *data, size_t &length)
 {
     length = 0;
@@ -44,7 +27,7 @@ int RequestJson(const String &url, uint8_t *data, size_t &length)
     http.setUserAgent(String("LilyGo-Weather-Display/2.5 (+https://github.com/bovine3dom/LilyGo-EPD-4-7-OWM-Weather-Display; ") + TRANSITOUS_CONTACT + ")");
     int status = http.GET();
     if (status == HTTP_CODE_OK) {
-        ResponseBuffer response(data);
+        BoundedResponse response(data, MaxResponse);
         if (http.writeToStream(&response) > 0) length = response.used;
         else status = -1;
     }

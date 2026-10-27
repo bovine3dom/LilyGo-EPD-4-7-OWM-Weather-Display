@@ -18,7 +18,9 @@ with tempfile.TemporaryDirectory() as directory:
     (root / ".env").write_text('WIFI_SSID="network"\nWIFI_PASSWORD="password"\nOWM_API_KEY="key"\n'
                                'WEATHER_CITY="Exampleville"\nWEATHER_COUNTRY="GB"\nTRANSITOUS_CONTACT="contact@example.org"\n'
                                'TRAM_STOP_NAME="Sample Stop"\nTRAM_STOP_LATITUDE="51.5"\nTRAM_STOP_LONGITUDE="-0.12"\n'
-                               'TRAM_MINIMUM_MINUTES="17"\nDEBUG_FAKE_WEATHER="1"\nDEBUG_SERIAL_WAKE_SECONDS="30"\n')
+                               'TRAM_MINIMUM_MINUTES="17"\nRAIL_STATION_ID="0012345678"\nRAIL_STATION_NAME="Example Station"\n'
+                               'RAIL_MINIMUM_MINUTES="21"\n'
+                               'DEBUG_FAKE_WEATHER="1"\nDEBUG_SERIAL_WAKE_SECONDS="30"\n')
 
     class Env:
         def subst(self, value):
@@ -30,7 +32,8 @@ with tempfile.TemporaryDirectory() as directory:
     assert "Transitous" not in config
     header = (root / ".pio" / "private_config.h").read_text()
     assert '"contact@example.org"' in header and '"Sample Stop"' in header
-    assert '#define TRAM_MINIMUM_SECONDS 1020' in header
+    assert '#define TRAM_MINIMUM_SECONDS 1020' in header and '#define RAIL_MINIMUM_SECONDS 1260' in header
+    assert '#define RAIL_STATION_ID "0012345678"' in header and '#define RAIL_STATION_TITLE "EXAMP..."' in header
     assert '#define DEBUG_FAKE_WEATHER 1' in header and '#define DEBUG_SERIAL_WAKE_SECONDS 30' in header
     assert config["OpenWeather"]["city"] == "Exampleville" and config["OpenWeather"]["country"] == "GB"
     assert "Transitous" not in json.loads((root / "data" / "config.json").read_text())
