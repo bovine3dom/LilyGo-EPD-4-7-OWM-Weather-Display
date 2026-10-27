@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Generate the firmware's Spleen bitmap fonts from the upstream BDF files."""
 
 import argparse

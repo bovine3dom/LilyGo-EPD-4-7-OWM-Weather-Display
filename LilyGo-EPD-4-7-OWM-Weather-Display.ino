@@ -8,6 +8,7 @@
 #include "freertos/task.h"     // In-built
 #include "epd_driver.h"        // https://github.com/Xinyuan-LilyGO/LilyGo-EPD47
 #include "esp_adc_cal.h"       // In-built
+#include <driver/rtc_io.h>
 
 #include <ArduinoJson.h> // https://github.com/bblanchon/ArduinoJson
 #include <HTTPClient.h>  // In-built
@@ -19,9 +20,11 @@
 #include "SPIFFS.h"
 #include "FS.h"
 
+#include ".pio/private_config.h"
 #include "owm_credentials.h"
 #include "forecast_record.h"
 #include "partial_display.h"
+#include "transitous.h"
 #include "lang.h"
 
 #define SCREEN_WIDTH EPD_WIDTH
@@ -75,6 +78,7 @@ float snow_readings[max_readings]        = {0};
 const int WakeupHour = 8;
 const int SleepHour = 21;
 int UpdateIntervalHours = 1;
+bool AwakeTramButtonPressed = false;
 const long RetrySleepSeconds = 60 * 60;
 long StartTime = 0;
 long SleepTimer = 0;
@@ -215,12 +219,14 @@ String FormatBatteryLifeEstimate()
     return String(estimate);
 }
 
+bool IsWeatherHour(int hour)
+{
+    return hour >= WakeupHour && hour <= SleepHour && (hour - WakeupHour) % UpdateIntervalHours == 0;
+}
+
 bool IsScheduledUpdate()
 {
-    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER)
-        return true;
-    return CurrentHour >= WakeupHour && CurrentHour <= SleepHour &&
-           (CurrentHour - WakeupHour) % UpdateIntervalHours == 0 && CurrentMin <= 1;
+    return esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER || IsWeatherHour(CurrentHour);
 }
 
 long SecondsUntilNextUpdate(time_t now)
@@ -247,6 +253,23 @@ long SecondsUntilNextUpdate(time_t now)
     return (long)difftime(mktime(&nextUpdate), now) + Delta;
 }
 
+long NextSleepSeconds(time_t now, long weatherSeconds, bool active, bool dirty, bool weatherWake, time_t next, time_t end, long debugSeconds)
+{
+    long result = weatherSeconds;
+    if (active)
+    {
+        long untilNext = now >= 1600000000 && next ? max(1L, (long)(next - now)) : 60;
+        if (end && now >= 1600000000) untilNext = min(untilNext, max(1L, (long)(end - now)));
+        result = min(result, untilNext);
+    }
+    else if (dirty)
+        result = min(result, 60L);
+    else if (weatherWake)
+        result = min(result, 1L);
+    if (debugSeconds > 0) result = min(result, debugSeconds);
+    return max(1L, result);
+}
+
 void BeginSleep()
 {
 #if EPDPARTIAL
@@ -254,7 +277,41 @@ void BeginSleep()
 #else
     epd_poweroff_all();
 #endif
-    SleepTimer = UpdateLocalTime() ? SecondsUntilNextUpdate(time(nullptr)) : RetrySleepSeconds;
+    time_t now = time(nullptr);
+    long weatherSeconds = now >= 1600000000 ? SecondsUntilNextUpdate(now) : RetrySleepSeconds;
+    bool active = false, dirty = false, weatherWake = false;
+    time_t next = 0, end = 0;
+#if EPDPARTIAL
+    Preferences page;
+    if (page.begin("tram-test", true))
+    {
+        active = page.getBool("active", false);
+        dirty = page.getBool("dirty", false);
+        weatherWake = page.getBool("weather_wake", false);
+        next = page.getULong64("next", 0);
+        end = page.getULong64("end", 0);
+        page.end();
+    }
+    else dirty = true;
+#endif
+    SleepTimer = NextSleepSeconds(now, weatherSeconds, active, dirty, weatherWake, next, end, DEBUG_SERIAL_WAKE_SECONDS);
+    if (!active && !dirty)
+    {
+        long retrySeconds = WeatherRetrySeconds(now);
+        if (retrySeconds > 0) SleepTimer = min(SleepTimer, retrySeconds);
+    }
+#if T5_47_PLUS_V2
+    pinMode(21, INPUT_PULLUP);
+    unsigned long releaseStart = millis();
+    while (!digitalRead(21) && millis() - releaseStart < 5000)
+        delay(10);
+    if (digitalRead(21))
+    {
+        rtc_gpio_pullup_en(GPIO_NUM_21);
+        rtc_gpio_pulldown_dis(GPIO_NUM_21);
+        esp_sleep_enable_ext0_wakeup(GPIO_NUM_21, 0);
+    }
+#endif
     esp_sleep_enable_timer_wakeup(SleepTimer * 1000000LL);                                        // in Secs, 1000000LL converts to Secs as unit = 1uSec
     Serial.println("Awake for : " + String((millis() - StartTime) / 1000.0, 3) + "-secs");
     Serial.println("Entering " + String(SleepTimer) + " (secs) of sleep time");
@@ -305,15 +362,36 @@ void StopWiFi()
     Serial.println("WiFi switched Off");
 }
 
+bool PollTramButton()
+{
+#if T5_47_PLUS_V2
+    if (!digitalRead(21)) AwakeTramButtonPressed = true;
+#endif
+    return AwakeTramButtonPressed;
+}
+
 void InitialiseSystem()
 {
     StartTime = millis();
+#if T5_47_PLUS_V2
+    pinMode(21, INPUT_PULLUP);
+#endif
     Serial.begin(115200);
-    unsigned long serialWaitStart = millis();
-    unsigned long serialWaitLimit = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER ? 1000 : 10000;
-    while (!Serial && millis() - serialWaitStart < serialWaitLimit)
-        delay(10);
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT0)
+    {
+        unsigned long serialWaitStart = millis();
+        while (!Serial && millis() - serialWaitStart < 1000 && !PollTramButton())
+            delay(10);
+        unsigned long window = esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER ? 10000 :
+                               (DEBUG_SERIAL_WAKE_SECONDS > 0 ? 5000 : 0);
+        unsigned long windowStart = millis();
+        while (millis() - windowStart < window && !PollTramButton())
+            delay(10);
+    }
     Serial.println(String(__FILE__) + "\nStarting...");
+    Serial.printf("Reset reason %d; wake cause %d; fake weather %d; debug wake %d s\n",
+                  (int)esp_reset_reason(), (int)esp_sleep_get_wakeup_cause(),
+                  DEBUG_FAKE_WEATHER, DEBUG_SERIAL_WAKE_SECONDS);
 #if !EPDPARTIAL
     epd_init();
 #endif
@@ -329,85 +407,348 @@ void loop()
     delay(1000);
 }
 
+String FitTramDestination(const char *destination)
+{
+    String text(destination);
+    int count = 0, truncateAt = 0;
+    for (unsigned i = 0; i < text.length(); ++i)
+        if ((static_cast<uint8_t>(text[i]) & 0xC0) != 0x80)
+        {
+            if (++count == 18) truncateAt = i;
+            if (count == 21) return text.substring(0, truncateAt) + "...";
+        }
+    return text;
+}
+
+void DisplayTramBoard(const TramDeparture *rows, size_t count, time_t updatedAt, bool ok)
+{
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    setFont(Spleen24Bold);
+    drawString(20, 16, TRAM_STOP_TITLE, LEFT);
+    char updated[6] = "--:--";
+    if (updatedAt)
+    {
+        struct tm localTime;
+        localtime_r(&updatedAt, &localTime);
+        strftime(updated, sizeof(updated), "%H:%M", &localTime);
+    }
+    setFont(Spleen24);
+    drawString(410, 16, updated, LEFT);
+    drawFastHLine(20, 55, 920, Black);
+    setFont(Spleen32);
+    TramGroup groups[8] = {};
+    size_t groupCount = ok ? GroupTramDepartures(rows, count, groups, 8) : 0;
+    if (!ok || !groupCount)
+        drawString(24, 73, ok ? "No departures found" : "Departures unavailable", LEFT);
+    for (size_t i = 0; i < groupCount; ++i)
+    {
+        int y = 73 + i * 57;
+        drawString(24, y, groups[i].line, LEFT);
+        drawString(130, y, FitTramDestination(groups[i].destination), LEFT);
+        for (size_t j = 0; j < groups[i].count; ++j)
+            drawString(480 + j * 95, y, groups[i].times[j], LEFT);
+        if (i + 1 < groupCount) fillRect(20, y + 44, 920, 2, LightGrey);
+    }
+}
+
+bool DisplayLoading(const char *message)
+{
+    if (!LoadDisplayedImage(framebuffer))
+        memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    fillRect(260, 210, 440, 76, White);
+    drawRect(260, 210, 440, 76, Black);
+    setFont(Spleen32);
+    drawString(480, 232, message, CENTER);
+    return UpdatePartialDisplay(framebuffer, false);
+}
+
+bool RestoreWeatherPage(Preferences &page)
+{
+    if (!LoadWeatherImage(framebuffer) || !UpdatePartialDisplay(framebuffer, false))
+        return false;
+    if (page.putBool("weather_wake", true) != 1 || page.putBool("dirty", false) != 1) return false;
+    Serial.println("Weather image restored");
+    return true;
+}
+
+bool RunTramPage()
+{
+#if EPDPARTIAL
+    Preferences page;
+    if (!page.begin("tram-test", false)) return true;
+    bool active = page.getBool("active", false);
+    bool button = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 || AwakeTramButtonPressed;
+    AwakeTramButtonPressed = false;
+    if (!active && page.getBool("dirty", false))
+    {
+        if (!RestoreWeatherPage(page))
+        {
+            Serial.println("Cannot restore saved weather image");
+            if (button) DisplayLoading("Weather unavailable");
+            page.end();
+            return true;
+        }
+        if (!button) { page.end(); return true; }
+    }
+    if (button && active)
+    {
+        if (page.putBool("dirty", true) == 1 && page.putBool("active", false) == 1)
+        {
+            DisplayLoading("Loading weather...");
+            RestoreWeatherPage(page);
+        }
+        page.end();
+        return true;
+    }
+    if (button && !active)
+    {
+        if (!SaveWeatherImage() && !LoadWeatherImage(framebuffer))
+        {
+            Serial.println("No usable weather image");
+            page.putBool("dirty", true);
+            DisplayLoading("Weather unavailable");
+            page.end();
+            return true;
+        }
+        if (page.putULong64("end", 0) != sizeof(uint64_t) ||
+            page.putULong64("next", 0) != sizeof(uint64_t) ||
+            page.putBool("dirty", true) != 1 || page.putBool("active", true) != 1)
+        {
+            Serial.println("Cannot start tram page");
+            page.end();
+            return true;
+        }
+        active = true;
+        DisplayLoading("Loading trams...");
+    }
+    if (!active)
+    {
+        if (page.getBool("weather_wake", false) && page.putBool("weather_wake", false) != 1)
+        {
+            page.end();
+            return true;
+        }
+        page.end();
+        return false;
+    }
+
+    time_t now = time(nullptr);
+    if (now < 1600000000)
+    {
+        bool synced = StartWiFi() == WL_CONNECTED && SetupTime();
+        StopWiFi();
+        if (!synced) { Serial.println("Clock unavailable for departures"); page.end(); return true; }
+        now = time(nullptr);
+    }
+    time_t end = page.getULong64("end", 0);
+    if (!end)
+    {
+        end = now + 300;
+        if (page.putULong64("end", end) != sizeof(uint64_t)) { page.end(); return true; }
+    }
+    if (now >= end)
+    {
+        if (page.putBool("dirty", true) == 1 && page.putBool("active", false) == 1)
+            RestoreWeatherPage(page);
+    }
+    else if (now >= (time_t)page.getULong64("next", 0) &&
+             page.putULong64("next", now + 60) == sizeof(uint64_t) &&
+             page.putBool("dirty", true) == 1)
+    {
+        TramDeparture *rows = static_cast<TramDeparture *>(ps_malloc(32 * sizeof(TramDeparture)));
+        size_t count = 0;
+        bool ok = rows && StartWiFi() == WL_CONNECTED && FetchTransitous(rows, 32, count);
+        StopWiFi();
+        DisplayTramBoard(rows, count, ok ? time(nullptr) : 0, ok);
+        free(rows);
+        if (UpdatePartialDisplay(framebuffer, false)) page.putBool("dirty", false);
+        Serial.printf("Transitous: %s, %u departures\n", ok ? "OK" : "failed", (unsigned)count);
+    }
+    page.end();
+    return true;
+#else
+    return false;
+#endif
+}
+bool LoadConfiguration()
+{
+    if (!SPIFFS.begin()) return false;
+    File file = SPIFFS.open("/config.json", "r");
+    StaticJsonDocument<1024> settings;
+    DeserializationError error = deserializeJson(settings, file);
+    file.close();
+    if (error) return false;
+    ssid = settings["WLAN"]["ssid"].as<String>();
+    password = settings["WLAN"]["password"].as<String>();
+    apikey = settings["OpenWeather"]["apikey"].as<String>();
+    server = settings["OpenWeather"]["server"].as<String>();
+    City = WEATHER_CITY;
+    Country = WEATHER_COUNTRY;
+    Hemisphere = settings["OpenWeather"]["hemisphere"].as<String>();
+    Units = settings["OpenWeather"]["units"].as<String>();
+    ntpServer = settings["ntp"]["server"].as<String>();
+    Timezone = settings["ntp"]["timezone"] | "UTC0";
+    setenv("TZ", Timezone.c_str(), 1);
+    tzset();
+    return true;
+}
+
+uint32_t WeatherSlot(time_t now)
+{
+    struct tm local;
+    localtime_r(&now, &local);
+    return ((local.tm_year + 1900) * 512 + local.tm_yday) * 24 + local.tm_hour;
+}
+
+const char *WeatherScheduleNamespace()
+{
+    return DEBUG_FAKE_WEATHER ? "weather-test" : "weather-sched";
+}
+
+bool ClaimWeatherAttempt(time_t now)
+{
+    Preferences prefs;
+    if (!prefs.begin(WeatherScheduleNamespace(), false)) return false;
+    bool ok = prefs.getUInt("success", 0) != WeatherSlot(now) &&
+              prefs.getULong64("retry_after", 0) <= (uint64_t)now &&
+              prefs.putULong64("retry_after", (uint64_t)now + 15 * 60) == sizeof(uint64_t);
+    prefs.end();
+    return ok;
+}
+
+void MarkWeatherSuccess(time_t now)
+{
+    Preferences prefs;
+    if (!prefs.begin(WeatherScheduleNamespace(), false)) return;
+    if (prefs.putUInt("success", WeatherSlot(now)) == sizeof(uint32_t))
+        prefs.putULong64("retry_after", 0);
+    prefs.end();
+}
+
+long WeatherRetrySeconds(time_t now)
+{
+    if (now < 1600000000) return 0;
+    struct tm local;
+    localtime_r(&now, &local);
+    if (!IsWeatherHour(local.tm_hour)) return 0;
+    Preferences prefs;
+    if (!prefs.begin(WeatherScheduleNamespace(), true)) return 0;
+    uint64_t retry = prefs.getULong64("retry_after", 0);
+    bool pending = retry && prefs.getUInt("success", 0) != WeatherSlot(now);
+    prefs.end();
+    return pending ? max(1L, (long)((int64_t)retry - now)) : 0;
+}
+
+#if DEBUG_FAKE_WEATHER
+void LoadFakeWeather(time_t now)
+{
+    auto &current = WxConditions[0];
+    current.Forecast0 = "scattered clouds";
+    current.Icon = "02d";
+    current.Temperature = 20.5;
+    current.Humidity = 62;
+    current.High = 23;
+    current.Low = 16;
+    current.Pressure = 1015;
+    current.Trend = "=";
+    current.Winddir = 225;
+    current.Windspeed = 3.4;
+    current.Cloudcover = 35;
+    current.Visibility = 10000;
+    current.Sunrise = now - 3 * 3600;
+    current.Sunset = now + 5 * 3600;
+    for (int i = 0; i < max_readings; ++i)
+    {
+        auto &forecast = WxForecast[i];
+        forecast.Dt = now + (i + 1) * 3 * 3600;
+        forecast.Icon = i % 3 ? "02d" : "01d";
+        forecast.Temperature = 17 + i % 7;
+        forecast.Low = forecast.Temperature - 2;
+        forecast.High = forecast.Temperature + 2;
+        forecast.Humidity = 55 + i % 10;
+        forecast.Pressure = 1010 + i % 8;
+        forecast.Rainfall = i % 5 == 0 ? 0.5 : 0;
+    }
+}
+#endif
+
 void setup()
 {
     InitialiseSystem();
-
-    if (!SPIFFS.begin() || !SPIFFS.exists("/config.json"))
+    if (!LoadConfiguration())
     {
         Serial.println("Configuration unavailable; upload the SPIFFS image");
         BeginSleep();
+        return;
     }
-    else
+    if (RunTramPage())
     {
-        StaticJsonDocument<1024> json1;
-        File configfile = SPIFFS.open("/config.json", "r");
-        DeserializationError error = deserializeJson(json1, configfile);
-        configfile.close();
-        if (error)
+        BeginSleep();
+        return;
+    }
+
+    BatteryVoltage = ReadBatteryVoltage();
+    UpdateIntervalHours = BatteryUpdateInterval(BatteryVoltage);
+    Serial.printf("Battery estimate %.2f V; refresh interval %d h\n", BatteryVoltage, UpdateIntervalHours);
+
+    bool wifiUsed = false, wifiConnected = false;
+    bool timeSynced = time(nullptr) >= 1600000000 && UpdateLocalTime();
+    if (!timeSynced)
+    {
+        wifiUsed = true;
+        wifiConnected = StartWiFi() == WL_CONNECTED;
+        timeSynced = wifiConnected && SetupTime();
+    }
+    if (timeSynced) UpdateBatteryLifeEstimate(time(nullptr));
+    bool updateDue = timeSynced && IsScheduledUpdate() && ClaimWeatherAttempt(time(nullptr));
+    bool RxWeather = false, RxForecast = false;
+    if (updateDue)
+    {
+#if DEBUG_FAKE_WEATHER
+        Serial.println("Using fake weather data");
+        LoadFakeWeather(time(nullptr));
+        RxWeather = RxForecast = true;
+#else
+        if (!wifiConnected)
         {
-            Serial.println("Invalid configuration; upload the SPIFFS image");
-            BeginSleep();
-            return;
+            wifiUsed = true;
+            wifiConnected = StartWiFi() == WL_CONNECTED;
         }
-
-        ssid = json1["WLAN"]["ssid"].as<String>();
-        password = json1["WLAN"]["password"].as<String>();
-
-        apikey     = json1["OpenWeather"]["apikey"].as<String>();
-        server     = json1["OpenWeather"]["server"].as<String>();
-        Country    = json1["OpenWeather"]["country"].as<String>();
-        City       = json1["OpenWeather"]["city"].as<String>();
-        Hemisphere = json1["OpenWeather"]["hemisphere"].as<String>();
-        Units      = json1["OpenWeather"]["units"].as<String>();
-
-        ntpServer = json1["ntp"]["server"].as<String>();
-        Timezone = json1["ntp"]["timezone"].as<String>();
-
-        BatteryVoltage = ReadBatteryVoltage();
-        UpdateIntervalHours = BatteryUpdateInterval(BatteryVoltage);
-        Serial.printf("Battery estimate %.2f V; refresh interval %d h\n", BatteryVoltage, UpdateIntervalHours);
-
-        bool timeSynced = StartWiFi() == WL_CONNECTED && SetupTime();
-        if (timeSynced)
-            UpdateBatteryLifeEstimate(time(nullptr));
-        bool updateDue = timeSynced && IsScheduledUpdate();
-        bool RxWeather = false;
-        bool RxForecast = false;
-        if (updateDue)
+        if (wifiConnected)
         {
             byte Attempts = 1;
             WiFiClient client;
             while ((!RxWeather || !RxForecast) && Attempts <= 2)
             {
-                if (!RxWeather)
-                    RxWeather = obtainWeatherData(client, "weather");
-                if (!RxForecast)
-                    RxForecast = obtainWeatherData(client, "forecast");
+                if (!RxWeather) RxWeather = obtainWeatherData(client, "weather");
+                if (!RxForecast) RxForecast = obtainWeatherData(client, "forecast");
                 Attempts++;
             }
         }
-        StopWiFi();
-        if (updateDue && RxWeather && RxForecast)
-        {
-            Serial.println("Received all weather data...");
-            DisplayWeather();
-#if EPDPARTIAL
-            UpdatePartialDisplay(framebuffer, CurrentHour == WakeupHour && CurrentMin <= 1);
-#else
-            epd_poweron();
-            epd_clear();
-            edp_update();
 #endif
-        }
-        else if (updateDue)
-            Serial.println("Weather update failed; keeping existing display");
-        else if (timeSynced)
-            Serial.println("Outside scheduled update times");
-        BeginSleep();
     }
+    if (wifiUsed) StopWiFi();
+    if (updateDue && RxWeather && RxForecast)
+    {
+        Serial.println("Received all weather data...");
+        DisplayWeather();
+#if EPDPARTIAL
+        bool displayed = UpdatePartialDisplay(framebuffer, CurrentHour == WakeupHour);
+#else
+        epd_poweron();
+        epd_clear();
+        edp_update();
+        bool displayed = true;
+#endif
+        if (displayed) MarkWeatherSuccess(time(nullptr));
+        else Serial.println("Weather display update failed");
+    }
+    else if (updateDue)
+        Serial.println("Weather update failed; keeping existing display");
+    else if (timeSynced)
+        Serial.println("Outside scheduled update times");
+    BeginSleep();
 }
-
 void Convert_Readings_to_Imperial()
 { // Only the first 3-hours are used
     WxConditions[0].Pressure = hPa_to_inHg(WxConditions[0].Pressure);
@@ -547,7 +888,6 @@ bool obtainWeatherData(WiFiClient &client, const String &RequestType)
     client.stop(); // close connection before sending a new request
     HTTPClient http;
     String uri = "/data/2.5/" + RequestType + "?q=" + City + "," + Country + "&APPID=" + apikey + "&mode=json&units=" + units + "&lang=" + Language;
-    // String uri = "/data/2.5/" + RequestType + "?id" + ID + "&APPID=" + apikey + "&mode=json&units=" + units + "&lang=" + Language; // Nice was getting geocoded to the mountains, lol
     if (RequestType != "weather")
     {
         uri += "&cnt=" + String(max_readings);
@@ -564,7 +904,7 @@ bool obtainWeatherData(WiFiClient &client, const String &RequestType)
     }
     else
     {
-        Serial.printf("connection failed, error: %s", http.errorToString(httpCode).c_str());
+        Serial.printf("Weather %s request failed: HTTP %d (%s)\n", RequestType.c_str(), httpCode, http.errorToString(httpCode).c_str());
         client.stop();
         http.end();
         return false;

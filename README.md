@@ -14,11 +14,19 @@
 ## Private build settings
 
 1. Copy `.env.example` to `.env`.
-2. Set `WIFI_SSID`, `WIFI_PASSWORD`, and `OWM_API_KEY` in `.env`.
+2. Set the Wi-Fi, OpenWeather, weather location, Transitous contact, tram stop and walking-time fields in `.env`.
 3. Build and upload firmware with `pio run -e T5_4_7Inc_Plus_V2 -t upload`.
 4. Upload the generated SPIFFS settings with `pio run -e T5_4_7Inc_Plus_V2 -t uploadfs`.
 
-Git ignores `.env`. The tracked `data/config.json` is a safe template. The build script writes a private SPIFFS copy under `.pio/fsdata`.
+Git ignores `.env`. The build script writes private settings under `.pio`. The firmware contains the configured location and Transitous contact. Share firmware images with care.
+
+## Debug settings
+
+Set `DEBUG_FAKE_WEATHER=1` to use sample weather data. Set `DEBUG_SERIAL_WAKE_SECONDS` to a positive number to add timer wakes for serial access. Set each value to `0` for normal operation. These settings can also be supplied as environment variables for one build.
+
+## Transit data
+
+Transit data is from [Transitous sources](https://transitous.org/sources/).
 
 ## Refresh schedule
 

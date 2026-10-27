@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Check the generated Spleen glyph data."""
 
 from pathlib import Path

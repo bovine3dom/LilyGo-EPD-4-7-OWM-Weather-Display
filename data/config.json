@@ -6,8 +6,8 @@
 	"OpenWeather": {
 		"apikey": "",
 		"server": "api.openweathermap.org",
-		"country": "FR",
-		"city": "Monaco",
+		"country": "",
+		"city": "",
 		"hemisphere": "north",
 		"units": "M"
 	},

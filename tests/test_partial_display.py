@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Exercise bitmap conversion and refresh-state recovery with host mocks."""
 
 from pathlib import Path
@@ -42,24 +43,25 @@ struct Preferences {
 #include <vector>
 #include <cstdint>
 #include <cstring>
-extern std::vector<uint8_t> stored;
+extern std::vector<uint8_t> stored, weatherStored;
 extern bool fail_write, fail_remove;
 struct File {
-    bool active = false;
-    explicit operator bool() const { return active; }
-    size_t size() { return stored.size(); }
-    size_t read(uint8_t *p, size_t n) { if (stored.size() < n) return 0; memcpy(p, stored.data(), n); return n; }
-    size_t write(const uint8_t *p, size_t n) { if (fail_write) return 0; stored.insert(stored.end(), p, p+n); return n; }
+    std::vector<uint8_t> *data = nullptr;
+    explicit operator bool() const { return data != nullptr; }
+    size_t size() { return data->size(); }
+    size_t read(uint8_t *p, size_t n) { if (data->size() < n) return 0; memcpy(p, data->data(), n); return n; }
+    size_t write(const uint8_t *p, size_t n) { if (fail_write) return 0; data->insert(data->end(), p, p+n); return n; }
     void close() {}
     void flush() {}
 };
 struct FS {
     bool exists(const char*) { return !stored.empty(); }
     bool remove(const char*) { if (fail_remove) return false; stored.clear(); return true; }
-    File open(const char*, const char *mode) {
-        if (*mode == 'r' && stored.empty()) return {};
-        if (*mode == 'w') stored.clear();
-        return {true};
+    File open(const char *path, const char *mode) {
+        auto &data = strstr(path, "weather") ? weatherStored : stored;
+        if (*mode == 'r' && data.empty()) return {};
+        if (*mode == 'w') data.clear();
+        return {&data};
     }
 };
 extern FS SPIFFS;
@@ -67,13 +69,14 @@ extern FS SPIFFS;
     "esp_sleep.h": r'''
 #pragma once
 #define ESP_SLEEP_WAKEUP_TIMER 1
+#define ESP_SLEEP_WAKEUP_EXT0 2
 extern int cause;
 inline int esp_sleep_get_wakeup_cause() { return cause; }
 ''',
     "EPD_Painter_1bit.h": r'''
 #pragma once
 #include <cstdint>
-extern int fulls, paints, adopts;
+extern int fulls, paints, adopts, begins, ends;
 struct Shift { int data, clk, strobe; };
 struct Preset { Shift shift; };
 static Preset EPD1B_PRESET;
@@ -81,11 +84,11 @@ struct EPD_Painter1bit {
     EPD_Painter1bit(Preset) {}
     void setAutoShutdown(bool) {}
     void setIdleTimeout(int) {}
-    bool begin() { return true; }
+    bool begin() { ++begins; return true; }
     void clear() { ++fulls; }
     void adoptScreen(const uint8_t*) { ++adopts; }
     void paint(const uint8_t*) { ++paints; }
-    void end() {}
+    void end() { ++ends; }
 };
 ''',
     "epd1b_power.h": r'''
@@ -106,10 +109,10 @@ harness = r'''
 #include "Arduino.h"
 #include "SPIFFS.h"
 SerialMock Serial; FS SPIFFS;
-std::vector<uint8_t> stored;
+std::vector<uint8_t> stored, weatherStored;
 std::map<std::string, uint32_t> values;
 bool fail_invalidate = false, fail_write = false, fail_remove = false;
-int cause = 0, fulls = 0, paints = 0, adopts = 0;
+int cause = 0, fulls = 0, paints = 0, adopts = 0, begins = 0, ends = 0;
 #include "SOURCE"
 int main() {
     std::vector<uint8_t> gray(Width * Height / 2, 0), bitmap(BitmapSize);
@@ -124,6 +127,15 @@ int main() {
     assert(bits == Width * Height / 2);
     std::fill(gray.begin(), gray.end(), 255);
     assert(UpdatePartialDisplay(gray.data(), false) && fulls == 1 && values["valid"] == 1);
+    assert(SaveWeatherImage());
+    std::vector<uint8_t> restored(gray.size(), 0);
+    assert(LoadWeatherImage(restored.data()) && restored == gray);
+    weatherStored[0] = 0x80;
+    assert(!LoadWeatherImage(restored.data()));
+    values["hash"] = checksum(weatherStored.data());
+    assert(LoadWeatherImage(restored.data()) && restored[0] == 0xF0);
+    weatherStored[0] = 0;
+    values["hash"] = checksum(weatherStored.data());
     cause = ESP_SLEEP_WAKEUP_TIMER;
     assert(UpdatePartialDisplay(gray.data(), false) && paints == 1);
     for (int i = 0; i < 5; ++i) { gray[i] = 0; assert(UpdatePartialDisplay(gray.data(), false)); }
@@ -141,9 +153,12 @@ int main() {
     assert(!UpdatePartialDisplay(gray.data(), false) && values["valid"] == 0);
     fail_remove = false; gray[11] = 0;
     assert(UpdatePartialDisplay(gray.data(), false) && fulls == 7);
-    cause = 0; assert(UpdatePartialDisplay(gray.data(), false) && fulls == 8);
+    assert(begins == 1 && ends == 0);
+    updatedThisWake = false; cause = 0; assert(UpdatePartialDisplay(gray.data(), false) && fulls == 8);
     fail_invalidate = true; cause = ESP_SLEEP_WAKEUP_TIMER; gray[12] = 0;
     int before = paints; assert(!UpdatePartialDisplay(gray.data(), false) && paints == before);
+    PowerOffPartialDisplay();
+    assert(ends == 1);
     puts("Bitmap and refresh-state tests passed");
 }
 '''.replace("SOURCE", str(root / "partial_display.cpp"))

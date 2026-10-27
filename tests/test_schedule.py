@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Exercise the firmware scheduler with local times and DST transitions."""
 
 from pathlib import Path
@@ -25,6 +26,23 @@ harness = r'''
 #include <cstdlib>
 #include <ctime>
 #include <cstdio>
+#include <algorithm>
+#include <cstdint>
+#include <map>
+#include <string>
+using std::min;
+using std::max;
+#define DEBUG_FAKE_WEATHER 0
+std::map<std::string, uint64_t> saved;
+bool prefOk = true;
+struct Preferences {
+    bool begin(const char*, bool) { return prefOk; }
+    uint32_t getUInt(const char *key, uint32_t fallback) { return saved.count(key) ? saved[key] : fallback; }
+    uint64_t getULong64(const char *key, uint64_t fallback) { return saved.count(key) ? saved[key] : fallback; }
+    size_t putUInt(const char *key, uint32_t value) { saved[key] = value; return sizeof(value); }
+    size_t putULong64(const char *key, uint64_t value) { saved[key] = value; return sizeof(value); }
+    void end() {}
+};
 const int WakeupHour = 8, SleepHour = 21;
 int UpdateIntervalHours = 1, CurrentHour = 0, CurrentMin = 0;
 long Delta = 30;
@@ -33,7 +51,9 @@ int wakeCause = ESP_SLEEP_WAKEUP_TIMER;
 int esp_sleep_get_wakeup_cause() { return wakeCause; }
 '''
 harness += "\n".join(function(signature) for signature in (
-    "int BatteryUpdateInterval(", "bool IsScheduledUpdate(", "long SecondsUntilNextUpdate(", "float SumOfPrecip("
+    "int BatteryUpdateInterval(", "bool IsWeatherHour(", "bool IsScheduledUpdate(", "long SecondsUntilNextUpdate(",
+    "long NextSleepSeconds(", "uint32_t WeatherSlot(", "const char *WeatherScheduleNamespace(",
+    "bool ClaimWeatherAttempt(", "void MarkWeatherSuccess(", "long WeatherRetrySeconds(", "float SumOfPrecip("
 ))
 harness += r'''
 static time_t local(int year, int month, int day, int hour, int minute) {
@@ -66,7 +86,7 @@ int main() {
         CurrentHour = hour;
         assert(IsScheduledUpdate() == (hour >= 8 && hour <= 21));
     }
-    CurrentHour = 12; CurrentMin = 2; assert(!IsScheduledUpdate());
+    CurrentHour = 12; CurrentMin = 2; assert(IsScheduledUpdate());
     wakeCause = 0; CurrentHour = 23; assert(IsScheduledUpdate());
     wakeCause = ESP_SLEEP_WAKEUP_TIMER; CurrentMin = 0;
     UpdateIntervalHours = 6;
@@ -86,6 +106,26 @@ int main() {
     assert(SecondsUntilNextUpdate(local(2027, 1, 1, 21, 0)) == 11 * 3600 + 30);
     assert(SecondsUntilNextUpdate(local(2027, 3, 27, 21, 0)) == 10 * 3600 + 30);
     assert(SecondsUntilNextUpdate(local(2027, 10, 30, 21, 0)) == 12 * 3600 + 30);
+    time_t now = local(2027, 1, 1, 8, 5);
+    assert(ClaimWeatherAttempt(now));
+    assert(!ClaimWeatherAttempt(now + 30));
+    assert(WeatherRetrySeconds(now + 30) == 870);
+    assert(ClaimWeatherAttempt(now + 900));
+    MarkWeatherSuccess(now + 900);
+    assert(!ClaimWeatherAttempt(now + 1800));
+    assert(WeatherRetrySeconds(now + 1800) == 0);
+    assert(ClaimWeatherAttempt(now + 3600));
+    assert(WeatherRetrySeconds(now + 3630) == 870);
+    UpdateIntervalHours = 6; assert(WeatherRetrySeconds(now + 3630) == 0); UpdateIntervalHours = 1;
+    prefOk = false; assert(!ClaimWeatherAttempt(now + 7200)); prefOk = true;
+    assert(NextSleepSeconds(now, 3600, false, false, false, 0, 0, 0) == 3600);
+    assert(NextSleepSeconds(now, 3600, false, false, false, 0, 0, 30) == 30);
+    assert(NextSleepSeconds(now, 3600, true, false, false, now + 60, now + 300, 0) == 60);
+    assert(NextSleepSeconds(now, 3600, true, false, false, now + 60, now + 20, 0) == 20);
+    assert(NextSleepSeconds(now, 3600, true, false, false, now - 1, now + 300, 0) == 1);
+    assert(NextSleepSeconds(0, 3600, true, false, false, 0, 0, 0) == 60);
+    assert(NextSleepSeconds(now, 3600, false, true, false, 0, 0, 0) == 60);
+    assert(NextSleepSeconds(now, 3600, false, false, true, 0, 0, 0) == 1);
     puts("Schedule and DST transition tests passed");
 }
 '''

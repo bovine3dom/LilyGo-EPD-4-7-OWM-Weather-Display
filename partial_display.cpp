@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "partial_display.h"
 
 #if EPDPARTIAL
@@ -18,6 +19,9 @@ constexpr int Height = 540;
 constexpr size_t BitmapSize = Width * Height / 8;
 constexpr unsigned FullRefreshAfter = 5;
 const char *const ImagePath = "/display-1bit.bin";
+const char *const WeatherPath = "/weather-1bit.bin";
+EPD_Painter1bit *activeDisplay = nullptr;
+bool updatedThisWake = false;
 
 uint32_t checksum(const uint8_t *data)
 {
@@ -43,14 +47,74 @@ void makeBitmap(const uint8_t *gray, uint8_t *bitmap)
         }
 }
 
-bool loadBitmap(uint8_t *bitmap, uint32_t expectedHash)
+bool loadBitmap(const char *path, uint8_t *bitmap, uint32_t expectedHash)
 {
-    File file = SPIFFS.open(ImagePath, "r");
+    File file = SPIFFS.open(path, "r");
     bool ok = file && file.size() == BitmapSize &&
               file.read(bitmap, BitmapSize) == BitmapSize && checksum(bitmap) == expectedHash;
     file.close();
     return ok;
 }
+}
+
+bool SaveWeatherImage()
+{
+    uint8_t *bitmap = static_cast<uint8_t *>(ps_malloc(BitmapSize));
+    if (!bitmap) return false;
+    Preferences display, weather;
+    bool ok = display.begin("display1bit", true) && display.getBool("valid", false) &&
+              loadBitmap(ImagePath, bitmap, display.getUInt("hash", 0));
+    display.end();
+    if (ok && weather.begin("weather1bit", false))
+    {
+        ok = weather.putBool("valid", false) == 1;
+        File file = ok ? SPIFFS.open(WeatherPath, "w") : File();
+        uint8_t buffer[512];
+        size_t written = 0;
+        while (file && written < BitmapSize)
+        {
+            size_t chunk = min(sizeof(buffer), BitmapSize - written);
+            memcpy(buffer, bitmap + written, chunk);
+            size_t count = file.write(buffer, chunk);
+            written += count;
+            if (count != chunk) break;
+        }
+        ok = written == BitmapSize;
+        file.close();
+        ok = ok && weather.putUInt("hash", checksum(bitmap)) == sizeof(uint32_t) &&
+             weather.putBool("valid", true) == 1;
+        weather.end();
+    }
+    else ok = false;
+    free(bitmap);
+    return ok;
+}
+
+bool LoadImage(const char *path, const char *name, uint8_t *framebuffer)
+{
+    uint8_t *bitmap = static_cast<uint8_t *>(ps_malloc(BitmapSize));
+    if (!bitmap) return false;
+    Preferences prefs;
+    bool ok = prefs.begin(name, true) && prefs.getBool("valid", false) &&
+              loadBitmap(path, bitmap, prefs.getUInt("hash", 0));
+    prefs.end();
+    if (ok)
+        for (size_t i = 0; i < BitmapSize; ++i)
+            for (int pair = 0; pair < 4; ++pair)
+                framebuffer[i * 4 + pair] = ((bitmap[i] & (0x80 >> (pair * 2))) ? 0 : 0x0F) |
+                                             ((bitmap[i] & (0x40 >> (pair * 2))) ? 0 : 0xF0);
+    free(bitmap);
+    return ok;
+}
+
+bool LoadWeatherImage(uint8_t *framebuffer)
+{
+    return LoadImage(WeatherPath, "weather1bit", framebuffer);
+}
+
+bool LoadDisplayedImage(uint8_t *framebuffer)
+{
+    return LoadImage(ImagePath, "display1bit", framebuffer);
 }
 
 void SetBatteryMeasurementPower(bool on)
@@ -67,6 +131,11 @@ void SetBatteryMeasurementPower(bool on)
 
 void PowerOffPartialDisplay()
 {
+    if (activeDisplay)
+    {
+        activeDisplay->end();
+        activeDisplay = nullptr;
+    }
     const auto &pins = EPD1B_PRESET.shift;
     for (int pin : {pins.data, pins.clk, pins.strobe})
     {
@@ -97,13 +166,14 @@ bool UpdatePartialDisplay(const uint8_t *framebuffer, bool morningRefresh)
         free(previous);
         return false;
     }
-    bool valid = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER &&
-                 prefs.getBool("valid", false) && loadBitmap(previous, prefs.getUInt("hash", 0));
+    auto cause = esp_sleep_get_wakeup_cause();
+    bool valid = (updatedThisWake || cause == ESP_SLEEP_WAKEUP_TIMER || cause == ESP_SLEEP_WAKEUP_EXT0) &&
+                 prefs.getBool("valid", false) && loadBitmap(ImagePath, previous, prefs.getUInt("hash", 0));
     unsigned partials = valid ? prefs.getUInt("partials", 0) : 0;
     time_t now = time(nullptr);
     struct tm localTime;
     localtime_r(&now, &localTime);
-    uint32_t today = (localTime.tm_year + 1900) * 512 + localTime.tm_yday;
+    uint32_t today = now >= 1600000000 ? (localTime.tm_year + 1900) * 512 + localTime.tm_yday : prefs.getUInt("full_day", 0);
     bool full = !valid || morningRefresh || partials >= FullRefreshAfter || prefs.getUInt("full_day", 0) != today;
     if (!full && memcmp(previous, next, BitmapSize) == 0)
     {
@@ -118,11 +188,15 @@ bool UpdatePartialDisplay(const uint8_t *framebuffer, bool morningRefresh)
     bool ok = prefs.putBool("valid", false) == 1;
     if (ok)
     {
-        // The driver's idle task retains this pointer until deep sleep.
+        // Keep the driver alive for multiple updates in this wake cycle.
         static EPD_Painter1bit display(EPD1B_PRESET);
-        display.setAutoShutdown(false);
-        display.setIdleTimeout(0);
-        ok = display.begin();
+        if (!activeDisplay)
+        {
+            display.setAutoShutdown(false);
+            display.setIdleTimeout(0);
+            if (display.begin()) activeDisplay = &display;
+        }
+        ok = activeDisplay != nullptr;
         if (ok)
         {
             Serial.printf("Display %s refresh\n", full ? "full" : "partial");
@@ -131,7 +205,6 @@ bool UpdatePartialDisplay(const uint8_t *framebuffer, bool morningRefresh)
             else
                 display.adoptScreen(previous);
             display.paint(next);
-            display.end();
             partials = full ? 0 : partials + 1;
 
             bool removed = !SPIFFS.exists(ImagePath) || SPIFFS.remove(ImagePath);
@@ -157,8 +230,8 @@ bool UpdatePartialDisplay(const uint8_t *framebuffer, bool morningRefresh)
                  prefs.putBool("valid", true) == 1;
         }
     }
-    if (!ok)
-        Serial.println("Display update or state save failed; a full refresh will be needed");
+    if (ok) updatedThisWake = true;
+    else Serial.println("Display update or state save failed; a full refresh will be needed");
     prefs.end();
     free(next);
     free(previous);
