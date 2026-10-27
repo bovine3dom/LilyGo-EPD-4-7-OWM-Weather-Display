@@ -44,13 +44,22 @@ struct Preferences {
 #include <cstdint>
 #include <cstring>
 extern std::vector<uint8_t> stored, weatherStored;
-extern bool fail_write, fail_remove;
+extern bool fail_write, fail_remove, fail_seek;
+extern size_t bytes_written;
+extern int writes_before_failure;
 struct File {
     std::vector<uint8_t> *data = nullptr;
+    size_t pos = 0;
     explicit operator bool() const { return data != nullptr; }
     size_t size() { return data->size(); }
-    size_t read(uint8_t *p, size_t n) { if (data->size() < n) return 0; memcpy(p, data->data(), n); return n; }
-    size_t write(const uint8_t *p, size_t n) { if (fail_write) return 0; data->insert(data->end(), p, p+n); return n; }
+    size_t read(uint8_t *p, size_t n) { if (data->size() - pos < n) return 0; memcpy(p, data->data() + pos, n); pos += n; return n; }
+    bool seek(size_t p) { if (fail_seek || p > data->size()) return false; pos = p; return true; }
+    size_t write(const uint8_t *p, size_t n) {
+        if (fail_write || writes_before_failure == 0) return 0;
+        if (writes_before_failure > 0) --writes_before_failure;
+        if (data->size() < pos + n) data->resize(pos + n);
+        memcpy(data->data() + pos, p, n); pos += n; bytes_written += n; return n;
+    }
     void close() {}
     void flush() {}
 };
@@ -112,7 +121,9 @@ harness = r'''
 SerialMock Serial; FS SPIFFS;
 std::vector<uint8_t> stored, weatherStored;
 std::map<std::string, uint32_t> values;
-bool fail_invalidate = false, fail_write = false, fail_remove = false;
+bool fail_invalidate = false, fail_write = false, fail_remove = false, fail_seek = false;
+size_t bytes_written = 0;
+int writes_before_failure = -1;
 int cause = 0, fulls = 0, paints = 0, adopts = 0, begins = 0, ends = 0;
 #include "SOURCE"
 int main() {
@@ -139,7 +150,11 @@ int main() {
     values["hash"] = checksum(weatherStored.data());
     cause = ESP_SLEEP_WAKEUP_TIMER;
     assert(UpdatePartialDisplay(gray.data(), false) && paints == 1);
-    for (int i = 0; i < 5; ++i) { gray[i] = 0; assert(UpdatePartialDisplay(gray.data(), false)); }
+    for (int i = 0; i < 5; ++i) {
+        gray[i] = 0; bytes_written = 0;
+        assert(UpdatePartialDisplay(gray.data(), false) && bytes_written == 512);
+        makeBitmap(gray.data(), bitmap.data()); assert(stored == bitmap);
+    }
     assert(adopts == 5 && values["partials"] == 5 && fulls == 1);
     gray[6] = 0; assert(UpdatePartialDisplay(gray.data(), false) && fulls == 2);
     assert(UpdatePartialDisplay(gray.data(), true) && fulls == 3);
@@ -150,7 +165,7 @@ int main() {
     assert(!UpdatePartialDisplay(gray.data(), false) && values["valid"] == 0);
     fail_write = false; gray[9] = 0;
     assert(UpdatePartialDisplay(gray.data(), false) && fulls == 6);
-    fail_remove = true; gray[10] = 0;
+    fail_remove = true; std::fill(gray.begin() + 10000, gray.begin() + 85000, 0);
     assert(!UpdatePartialDisplay(gray.data(), false) && values["valid"] == 0);
     fail_remove = false; gray[11] = 0;
     assert(UpdatePartialDisplay(gray.data(), false) && fulls == 7);
@@ -160,6 +175,23 @@ int main() {
     updatedThisWake = false; cause = 0; assert(UpdatePartialDisplay(gray.data(), false) && fulls == 8);
     fail_invalidate = true; cause = ESP_SLEEP_WAKEUP_TIMER; gray[13] = 0;
     int before = paints; assert(!UpdatePartialDisplay(gray.data(), false) && paints == before);
+    fail_invalidate = false; fail_seek = true;
+    assert(!UpdatePartialDisplay(gray.data(), false) && values["valid"] == 0);
+    fail_seek = false; bytes_written = 0;
+    assert(UpdatePartialDisplay(gray.data(), false) && bytes_written == BitmapSize);
+    makeBitmap(gray.data(), bitmap.data()); assert(stored == bitmap);
+    for (int i = 45; i < 77; ++i) gray[i * 2048] = 0;
+    bytes_written = 0; assert(UpdatePartialDisplay(gray.data(), false) && bytes_written == 32 * 512);
+    makeBitmap(gray.data(), bitmap.data()); assert(stored == bitmap);
+    for (int i = 80; i < 113; ++i) gray[i * 2048] = 0;
+    bytes_written = 0; assert(UpdatePartialDisplay(gray.data(), false) && bytes_written == BitmapSize);
+    makeBitmap(gray.data(), bitmap.data()); assert(stored == bitmap);
+    gray[120 * 2048] = 0; gray[122 * 2048] = 0;
+    writes_before_failure = 1;
+    assert(!UpdatePartialDisplay(gray.data(), false) && values["valid"] == 0);
+    writes_before_failure = -1; updatedThisWake = false; cause = ESP_SLEEP_WAKEUP_TIMER;
+    bytes_written = 0; assert(UpdatePartialDisplay(gray.data(), false) && bytes_written == BitmapSize);
+    makeBitmap(gray.data(), bitmap.data()); assert(stored == bitmap);
     PowerOffPartialDisplay();
     assert(ends == 1);
     puts("Bitmap and refresh-state tests passed");

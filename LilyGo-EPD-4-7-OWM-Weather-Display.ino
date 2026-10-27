@@ -62,6 +62,9 @@ String Time_str = "--:--:--";
 String Date_str = "-- --- ----";
 int wifi_signal, CurrentHour = 0, CurrentMin = 0, CurrentSec = 0, EventCnt = 0;
 RTC_DATA_ATTR bool WiFiConnectionFailed = false;
+RTC_DATA_ATTR char CachedWiFiSSID[33] = {};
+RTC_DATA_ATTR uint8_t CachedWiFiBSSID[6] = {};
+RTC_DATA_ATTR int32_t CachedWiFiChannel = 0;
 float BatteryVoltage = 0.0f;
 int64_t BatteryLifeEstimateSeconds = -1;
 //################ PROGRAM VARIABLES and OBJECTS ##########################################
@@ -349,29 +352,47 @@ boolean SetupTime()
 
 uint8_t StartWiFi()
 {
-    Serial.println("\r\nConnecting to: " + String(ssid));
-    IPAddress dns(8, 8, 8, 8); // Use Google DNS
     WiFi.disconnect();
-    WiFi.mode(WIFI_STA); // switch off AP
+    WiFi.mode(WIFI_STA);
     WiFi.setAutoConnect(true);
     WiFi.setAutoReconnect(true);
-    WiFi.begin(const_cast<const char *>(ssid.c_str()), const_cast<const char *>(password.c_str()));
-    if (WiFi.waitForConnectResult() != WL_CONNECTED)
+    uint8_t status = WL_DISCONNECTED;
+    if (CachedWiFiChannel >= 1 && CachedWiFiChannel <= 14 &&
+        strncmp(CachedWiFiSSID, ssid.c_str(), sizeof(CachedWiFiSSID)) == 0)
     {
-        Serial.printf("STA: Failed!\n");
-        WiFi.disconnect(false);
-        delay(500);
-        WiFi.begin(const_cast<const char *>(ssid.c_str()), const_cast<const char *>(password.c_str()));
+        unsigned long start = millis();
+        WiFi.begin(ssid.c_str(), password.c_str(), CachedWiFiChannel, CachedWiFiBSSID);
+        status = WiFi.waitForConnectResult(5000);
+        Serial.printf("WiFi cached AP: %s in %lu ms\n", status == WL_CONNECTED ? "connected" : "failed", millis() - start);
+        if (status != WL_CONNECTED)
+        {
+            CachedWiFiChannel = 0;
+            WiFi.disconnect();
+            WiFi.mode(WIFI_OFF);
+            WiFi.mode(WIFI_STA);
+        }
     }
-    uint8_t status = WiFi.status();
+    if (status != WL_CONNECTED)
+    {
+        unsigned long start = millis();
+        WiFi.begin(ssid.c_str(), password.c_str());
+        status = WiFi.waitForConnectResult();
+        Serial.printf("WiFi scan: %s in %lu ms\n", status == WL_CONNECTED ? "connected" : "failed", millis() - start);
+    }
     WiFiConnectionFailed = status != WL_CONNECTED;
     if (!WiFiConnectionFailed)
     {
-        wifi_signal = WiFi.RSSI(); // Get Wifi Signal strength now, because the WiFi will be turned off to save power!
-        Serial.println("WiFi connected at: " + WiFi.localIP().toString());
+        wifi_signal = WiFi.RSSI();
+        const uint8_t *bssid = WiFi.BSSID();
+        int32_t channel = WiFi.channel();
+        CachedWiFiChannel = 0;
+        if (bssid && channel >= 1 && channel <= 14 && ssid.length() <= 32)
+        {
+            memcpy(CachedWiFiBSSID, bssid, sizeof(CachedWiFiBSSID));
+            memcpy(CachedWiFiSSID, ssid.c_str(), ssid.length() + 1);
+            CachedWiFiChannel = channel;
+        }
     }
-    else
-        Serial.println("WiFi connection *** FAILED ***");
     return status;
 }
 

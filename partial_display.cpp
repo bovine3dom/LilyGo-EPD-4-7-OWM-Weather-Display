@@ -208,20 +208,24 @@ bool UpdatePartialDisplay(const uint8_t *framebuffer, bool morningRefresh)
             display.paint(next);
             partials = full ? 0 : partials + 1;
 
-            bool removed = !SPIFFS.exists(ImagePath) || SPIFFS.remove(ImagePath);
-            File file = removed ? SPIFFS.open(ImagePath, "w") : File();
-            size_t written = 0;
             uint8_t buffer[512];
-            while (file && written < BitmapSize)
+            unsigned changed = 0;
+            if (!full)
+                for (size_t pos = 0; pos < BitmapSize; pos += sizeof(buffer))
+                    if (memcmp(previous + pos, next + pos, min(sizeof(buffer), BitmapSize - pos)) != 0)
+                        ++changed;
+            // Small updates avoid rewriting the whole snapshot; large ones are faster as a full write.
+            bool incremental = !full && changed <= 32;
+            bool ready = incremental || !SPIFFS.exists(ImagePath) || SPIFFS.remove(ImagePath);
+            File file = ready ? SPIFFS.open(ImagePath, incremental ? "r+" : "w") : File();
+            ok = bool(file);
+            for (size_t pos = 0; ok && pos < BitmapSize; pos += sizeof(buffer))
             {
-                size_t chunk = min(sizeof(buffer), BitmapSize - written);
-                memcpy(buffer, next + written, chunk);
-                size_t count = file.write(buffer, chunk);
-                written += count;
-                if (count != chunk)
-                    break;
+                size_t chunk = min(sizeof(buffer), BitmapSize - pos);
+                if (incremental && memcmp(previous + pos, next + pos, chunk) == 0) continue;
+                memcpy(buffer, next + pos, chunk);
+                ok = (!incremental || file.seek(pos)) && file.write(buffer, chunk) == chunk;
             }
-            ok = written == BitmapSize;
             if (file)
                 file.flush();
             file.close();
