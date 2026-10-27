@@ -21,6 +21,7 @@
 
 #include "owm_credentials.h"
 #include "forecast_record.h"
+#include "partial_display.h"
 #include "lang.h"
 #include "web.h"
 
@@ -60,6 +61,7 @@ float BatteryVoltage = 0.0f;
 int64_t BatteryLifeEstimateSeconds = -1;
 //################ PROGRAM VARIABLES and OBJECTS ##########################################
 #define max_readings 24 // Limited to 3-days here, but could go to 5-days = 40
+const int ForecastWidth = 90;
 
 Forecast_record_type WxConditions[1];
 Forecast_record_type WxForecast[max_readings];
@@ -70,21 +72,16 @@ float humidity_readings[max_readings]    = {0};
 float rain_readings[max_readings]        = {0};
 float snow_readings[max_readings]        = {0};
 
-// Refresh between 06:00 and 21:00. Battery tiers use 3, 6, 12, or 24 hours.
-const int WakeupHour = 6;
+// Refresh from 08:00 through 21:00. Battery tiers use 1, 6, 12, or 24 hours.
+const int WakeupHour = 8;
 const int SleepHour = 21;
-int UpdateIntervalHours = 3;
+int UpdateIntervalHours = 1;
 const long RetrySleepSeconds = 60 * 60;
 long StartTime = 0;
 long SleepTimer = 0;
 long Delta = 30; // ESP32 RTC speed compensation
 
-//fonts
-#include "opensans8b.h"
-#include "opensans10b.h"
-#include "opensans12b.h"
-#include "opensans18b.h"
-#include "opensans24b.h"
+#include "fonts/spleen.h"
 
 GFXfont currentFont;
 uint8_t *framebuffer;
@@ -106,7 +103,11 @@ float ReadBatteryVoltage()
         Serial.println("Battery ADC calibration unavailable");
         return 0.0f;
     }
+#if EPDPARTIAL
+    SetBatteryMeasurementPower(true);
+#else
     epd_poweron();
+#endif
     delay(10);
     uint32_t raw = 0;
     for (int sample = 0; sample < 8; ++sample)
@@ -115,7 +116,12 @@ float ReadBatteryVoltage()
         delay(2);
     }
     uint32_t averageRaw = raw / 8;
+#if EPDPARTIAL
+    SetBatteryMeasurementPower(false);
+    PowerOffPartialDisplay();
+#else
     epd_poweroff_all();
+#endif
     float voltage = esp_adc_cal_raw_to_voltage(averageRaw, &adc_chars) * 2.0f / 1000.0f;
     Serial.printf("Battery ADC raw %u, calibration %d -> %.3f V\n", averageRaw, (int)calibration, voltage);
     return voltage >= 1.0f && voltage <= 5.0f ? voltage : 0.0f;
@@ -123,10 +129,8 @@ float ReadBatteryVoltage()
 
 int BatteryUpdateInterval(float voltage)
 {
-    if (!(voltage >= 1.0f && voltage <= 5.0f))
-        return 3;
-    if (voltage >= 4.15f)
-        return 3;
+    if (!(voltage >= 1.0f && voltage <= 5.0f) || voltage >= 4.15f)
+        return 1;
     if (voltage >= 3.95f)
         return 6;
     if (voltage >= 3.75f)
@@ -246,7 +250,11 @@ long SecondsUntilNextUpdate(time_t now)
 
 void BeginSleep()
 {
+#if EPDPARTIAL
+    PowerOffPartialDisplay();
+#else
     epd_poweroff_all();
+#endif
     SleepTimer = UpdateLocalTime() ? SecondsUntilNextUpdate(time(nullptr)) : RetrySleepSeconds;
     esp_sleep_enable_timer_wakeup(SleepTimer * 1000000LL);                                        // in Secs, 1000000LL converts to Secs as unit = 1uSec
     Serial.println("Awake for : " + String((millis() - StartTime) / 1000.0, 3) + "-secs");
@@ -260,6 +268,7 @@ boolean SetupTime()
     configTime(gmtOffset_sec, daylightOffset_sec, const_cast<const char *>(ntpServer.c_str()), "time.nist.gov"); //(gmtOffset_sec, daylightOffset_sec, ntpServer)
     setenv("TZ", const_cast<const char *>(Timezone.c_str()), 1);                                                 //setenv()adds the "TZ" variable to the environment with a value TimeZone, only used if set to 1, 0 means no change
     tzset();                                                                   // Set the TZ environment variable
+    Serial.println("Timezone: " + Timezone);
     delay(100);
     return UpdateLocalTime();
 }
@@ -306,7 +315,9 @@ void InitialiseSystem()
     while (!Serial && millis() - serialWaitStart < serialWaitLimit)
         delay(10);
     Serial.println(String(__FILE__) + "\nStarting...");
+#if !EPDPARTIAL
     epd_init();
+#endif
     framebuffer = (uint8_t *)ps_calloc(sizeof(uint8_t), EPD_WIDTH * EPD_HEIGHT / 2);
     if (!framebuffer)
         Serial.println("Memory alloc failed!");
@@ -387,10 +398,14 @@ void setup()
         if (updateDue && RxWeather && RxForecast)
         {
             Serial.println("Received all weather data...");
+            DisplayWeather();
+#if EPDPARTIAL
+            UpdatePartialDisplay(framebuffer, CurrentHour == WakeupHour && CurrentMin <= 1);
+#else
             epd_poweron();
             epd_clear();
-            DisplayWeather();
             edp_update();
+#endif
         }
         else if (updateDue)
             Serial.println("Weather update failed; keeping existing display");
@@ -595,7 +610,7 @@ int JulianDate(int d, int m, int y)
 float SumOfPrecip(float DataArray[], int readings)
 {
     float sum = 0;
-    for (int i = 0; i <= readings; i++)
+    for (int i = 0; i < readings; i++)
     {
         sum += DataArray[i];
     }
@@ -635,10 +650,10 @@ void DisplayWeather()
 
 void DisplayGeneralInfoSection()
 {
-    setFont(OpenSans10B);
-    drawString(5, 2, City, LEFT);
-    setFont(OpenSans8B);
-    drawString(350, 2, Date_str + "  @   " + Time_str, LEFT);
+    setFont(Spleen24Bold);
+    drawString(5, 10, City, LEFT);
+    setFont(Spleen24);
+    drawString(190, 10, Date_str + " @ " + Time_str, LEFT);
 }
 
 void DisplayWeatherIcon(int x, int y)
@@ -648,7 +663,6 @@ void DisplayWeatherIcon(int x, int y)
 
 void DisplayMainWeatherSection(int x, int y)
 {
-    setFont(OpenSans8B);
     DisplayTemperatureSection(x, y - 40);
     DisplayForecastTextSection(x - 55, y + 25);
     DisplayPressureSection(x - 25, y + 90, WxConditions[0].Pressure, WxConditions[0].Trend);
@@ -657,7 +671,7 @@ void DisplayMainWeatherSection(int x, int y)
 void DisplayDisplayWindSection(int x, int y, float angle, float windspeed, int Cradius)
 {
     arrow(x, y, Cradius - 22, angle, 18, 33); // Show wind direction on outer circle of width and length
-    setFont(OpenSans8B);
+    setFont(Spleen24);
     int dxo, dyo, dxi, dyi;
     drawCircle(x, y, Cradius, Black);       // Draw compass circle
     drawCircle(x, y, Cradius + 1, Black);   // Draw compass circle
@@ -667,13 +681,13 @@ void DisplayDisplayWindSection(int x, int y, float angle, float windspeed, int C
         dxo = Cradius * cos((a - 90) * PI / 180);
         dyo = Cradius * sin((a - 90) * PI / 180);
         if (a == 45)
-            drawString(dxo + x + 15, dyo + y - 18, TXT_NE, CENTER);
+            drawString(dxo + x + 15, dyo + y - 27, TXT_NE, CENTER);
         if (a == 135)
-            drawString(dxo + x + 20, dyo + y - 2, TXT_SE, CENTER);
+            drawString(dxo + x + 20, dyo + y - 11, TXT_SE, CENTER);
         if (a == 225)
-            drawString(dxo + x - 20, dyo + y - 2, TXT_SW, CENTER);
+            drawString(dxo + x - 20, dyo + y - 11, TXT_SW, CENTER);
         if (a == 315)
-            drawString(dxo + x - 15, dyo + y - 18, TXT_NW, CENTER);
+            drawString(dxo + x - 15, dyo + y - 27, TXT_NW, CENTER);
         dxi = dxo * 0.9;
         dyi = dyo * 0.9;
         drawLine(dxo + x, dyo + y, dxi + x, dyi + y, Black);
@@ -683,17 +697,18 @@ void DisplayDisplayWindSection(int x, int y, float angle, float windspeed, int C
         dyi = dyo * 0.9;
         drawLine(dxo + x, dyo + y, dxi + x, dyi + y, Black);
     }
-    drawString(x, y - Cradius - 20, TXT_N, CENTER);
-    drawString(x, y + Cradius + 10, TXT_S, CENTER);
-    drawString(x - Cradius - 15, y - 5, TXT_W, CENTER);
-    drawString(x + Cradius + 10, y - 5, TXT_E, CENTER);
-    drawString(x + 3, y + 50, String(angle, 0) + "°", CENTER);
-    setFont(OpenSans12B);
+    drawString(x, y - Cradius - 29, TXT_N, CENTER);
+    drawString(x, y + Cradius + 1, TXT_S, CENTER);
+    drawString(x - Cradius - 15, y - 14, TXT_W, CENTER);
+    drawString(x + Cradius + 10, y - 14, TXT_E, CENTER);
+    setFont(Spleen16);
+    drawString(x + 3, y + 70, String(angle, 0) + "°", CENTER);
+    setFont(Spleen24);
     drawString(x, y - 50, WindDegToOrdinalDirection(angle), CENTER);
-    setFont(OpenSans24B);
-    drawString(x + 3, y - 18, String(windspeed, 1), CENTER);
-    setFont(OpenSans12B);
-    drawString(x, y + 25, (Units == "M" ? "m/s" : "mph"), CENTER);
+    setFont(Spleen64Bold);
+    drawString(x + 3, y - 38, String(windspeed, 1), CENTER);
+    setFont(Spleen32);
+    drawString(x, y + 21, (Units == "M" ? "m/s" : "mph"), CENTER);
 }
 
 String WindDegToOrdinalDirection(float winddirection)
@@ -735,16 +750,20 @@ String WindDegToOrdinalDirection(float winddirection)
 
 void DisplayTemperatureSection(int x, int y)
 {
-    setFont(OpenSans18B);
-    drawString(x - 30, y, String(WxConditions[0].Temperature, 1) + "°    " + String(WxConditions[0].Humidity, 0) + "%", LEFT);
-    setFont(OpenSans12B);
-    drawString(x + 10, y + 35, String(WxConditions[0].High, 0) + "° | " + String(WxConditions[0].Low, 0) + "°", CENTER); // Show forecast high and Low
+    setFont(Spleen48Bold);
+    String temperature = String(WxConditions[0].Temperature, 1) + "°";
+    int bx, by, width, height, cx = 0, cy = 0;
+    get_text_bounds(&currentFont, temperature.c_str(), &cx, &cy, &bx, &by, &width, &height, NULL);
+    drawString(x - 30, y - 15, temperature, LEFT);
+    drawString(max(x + 103, x - 30 + width + 12), y - 15, String(WxConditions[0].Humidity, 0) + "%", LEFT);
+    setFont(Spleen32);
+    drawString(x - 30, y + 29, String(WxConditions[0].High, 0) + "° | " + String(WxConditions[0].Low, 0) + "°", LEFT);
 }
 
 void DisplayForecastTextSection(int x, int y)
 {
 #define lineWidth 34
-    setFont(OpenSans12B);
+    setFont(Spleen24);
     //Wx_Description = WxConditions[0].Main0;          // e.g. typically 'Clouds'
     String Wx_Description = WxConditions[0].Forecast0; // e.g. typically 'overcast clouds' ... you choose which
     Wx_Description.replace(".", "");                   // remove any '.'
@@ -773,7 +792,7 @@ void DisplayForecastTextSection(int x, int y)
 
 void DisplayPressureSection(int x, int y, float pressure, String slope)
 {
-    setFont(OpenSans12B);
+    setFont(Spleen32);
     DrawPressureAndTrend(x - 25, y + 10, pressure, slope);
     if (WxConditions[0].Visibility > 0)
     {
@@ -786,17 +805,17 @@ void DisplayPressureSection(int x, int y, float pressure, String slope)
 
 void DisplayForecastWeather(int x, int y, int index)
 {
-    int fwidth = 90;
+    int fwidth = ForecastWidth;
     x = x + fwidth * index;
     DisplayConditionsSection(x + fwidth / 2, y + 90, WxForecast[index].Icon, SmallIcon);
-    setFont(OpenSans10B);
-    drawString(x + fwidth / 2, y + 30, String(ConvertUnixTime(WxForecast[index].Dt + WxConditions[0].Timezone).substring(0, 5)), CENTER);
+    setFont(Spleen24);
+    drawString(x + fwidth / 2, y + 30, String(ConvertUnixTime(WxForecast[index].Dt).substring(0, 5)), CENTER);
     drawString(x + fwidth / 2, y + 125, String(WxForecast[index].High, 0) + "°/" + String(WxForecast[index].Low, 0) + "°", CENTER);
 }
 
 void DisplayAstronomySection(int x, int y)
 {
-    setFont(OpenSans10B);
+    setFont(Spleen24);
     drawString(x + 5, y + 30, ConvertUnixTime(WxConditions[0].Sunrise).substring(0, 5) + " " + TXT_SUNRISE, LEFT);
     drawString(x + 5, y + 50, ConvertUnixTime(WxConditions[0].Sunset).substring(0, 5) + " " + TXT_SUNSET, LEFT);
     time_t now = time(NULL);
@@ -891,12 +910,8 @@ String MoonPhase(int d, int m, int y, String hemisphere)
 
 void DisplayForecastSection(int x, int y)
 {
-    int f = 0;
-    do
-    {
+    for (int f = 0; f < max_readings && x + (f + 1) * ForecastWidth <= SCREEN_WIDTH; ++f)
         DisplayForecastWeather(x, y, f);
-        f++;
-    } while (f < max_readings);
     int r = 0;
     do
     { // Pre-load temporary arrays with with data - because C parses by reference and remember that[1] has already been converted to I units
@@ -985,7 +1000,7 @@ void DrawSegment(int x, int y, int o1, int o2, int o3, int o4, int o11, int o12,
 
 void DrawPressureAndTrend(int x, int y, float pressure, String slope)
 {
-    drawString(x + 25, y - 10, String(pressure, (Units == "M" ? 0 : 1)) + (Units == "M" ? "hPa" : "in"), LEFT);
+    drawString(x + 25, y - 22, String(pressure, (Units == "M" ? 0 : 1)) + (Units == "M" ? "hPa" : "in"), LEFT);
     if (slope == "+")
     {
         DrawSegment(x, y, 0, 0, 8, -8, 8, -8, 16, 0);
@@ -1005,9 +1020,9 @@ void DrawPressureAndTrend(int x, int y, float pressure, String slope)
 
 void DisplayStatusSection(int x, int y, int rssi)
 {
-    setFont(OpenSans8B);
+    setFont(Spleen24);
     DrawRSSI(x + 305, y + 15, rssi);
-    DrawBattery(x + 50, y);
+    DrawBattery(x - 45, y + 4);
 }
 
 void DrawRSSI(int x, int y, int rssi)
@@ -1069,9 +1084,9 @@ void DrawBattery(int x, int y)
     { // Only display if there is a valid reading
         uint8_t percentage = BatteryPercentage(voltage);
         Serial.println("\nVoltage = " + String(voltage));
-        drawRect(x + 25, y - 14, 40, 15, Black);
-        fillRect(x + 65, y - 10, 4, 7, Black);
-        fillRect(x + 27, y - 12, 36 * percentage / 100.0, 11, Black);
+        drawRect(x + 25, y - 5, 40, 15, Black);
+        fillRect(x + 65, y - 1, 4, 7, Black);
+        fillRect(x + 27, y - 3, 36 * percentage / 100.0, 11, Black);
         drawString(x + 85, y - 14, String(percentage) + "%  " + String(voltage, 1) + "v ~" + FormatBatteryLifeEstimate(), LEFT);
     }
 }
@@ -1095,12 +1110,12 @@ void addrain(int x, int y, int scale, bool IconSize)
 {
     if (IconSize == SmallIcon)
     {
-        setFont(OpenSans8B);
+        setFont(Spleen16);
         drawString(x - 25, y + 12, "///////", LEFT);
     }
     else
     {
-        setFont(OpenSans18B);
+        setFont(Spleen24);
         drawString(x - 60, y + 25, "///////", LEFT);
     }
 }
@@ -1109,12 +1124,12 @@ void addsnow(int x, int y, int scale, bool IconSize)
 {
     if (IconSize == SmallIcon)
     {
-        setFont(OpenSans8B);
+        setFont(Spleen16);
         drawString(x - 25, y + 15, "* * * *", LEFT);
     }
     else
     {
-        setFont(OpenSans18B);
+        setFont(Spleen24);
         drawString(x - 60, y + 30, "* * * *", LEFT);
     }
 }
@@ -1346,7 +1361,7 @@ void CloudCover(int x, int y, int CCover)
     addcloud(x - 9, y + 2, Small * 0.3, 2); // Cloud top left
     addcloud(x + 3, y - 2, Small * 0.3, 2); // Cloud top right
     addcloud(x, y + 10, Small * 0.6, 2);    // Main cloud
-    drawString(x + 20, y, String(CCover) + "%", LEFT);
+    drawString(x + 20, y - 12, String(CCover) + "%", LEFT);
 }
 
 void Visibility(int x, int y, String Visi)
@@ -1366,7 +1381,7 @@ void Visibility(int x, int y, String Visi)
         drawPixel(x + r * cos(i), 1 + y + r / 2 + r * sin(i) + Offset, Black);
     }
     fillCircle(x, y + Offset, r / 4, Black);
-    drawString(x + 20, y, Visi, LEFT);
+    drawString(x + 20, y - 12, Visi, LEFT);
 }
 
 void addmoon(int x, int y, int scale, bool IconSize)
@@ -1386,9 +1401,9 @@ void addmoon(int x, int y, int scale, bool IconSize)
 void Nodata(int x, int y, bool IconSize, String IconName)
 {
     if (IconSize == LargeIcon)
-        setFont(OpenSans24B);
+        setFont(Spleen64Bold);
     else
-        setFont(OpenSans12B);
+        setFont(Spleen24);
     drawString(x - 3, y - 10, "?", CENTER);
 }
 
@@ -1411,7 +1426,7 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
 {
 #define auto_scale_margin 0 // Sets the autoscale increment, so axis steps up fter a change of e.g. 3
 #define y_minor_axis 5      // 5 y-axis division markers
-    setFont(OpenSans10B);
+    setFont(Spleen24);
     int maxYscale = -10000;
     int minYscale = 10000;
     int last_x, last_y;
@@ -1435,7 +1450,7 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
     last_x = x_pos + 1;
     last_y = y_pos + (Y1Max - constrain(DataArray[1], Y1Min, Y1Max)) / (Y1Max - Y1Min) * gheight;
     drawRect(x_pos, y_pos, gwidth + 3, gheight + 2, Grey);
-    drawString(x_pos - 20 + gwidth / 2, y_pos - 28, title, CENTER);
+    drawString(x_pos - 20 + gwidth / 2, y_pos - 34, title, CENTER);
     for (int gx = 0; gx < readings; gx++)
     {
         x2 = x_pos + gx * gwidth / (readings - 1) - 1; // max_readings is the global variable that sets the maximum data that can be plotted
@@ -1463,23 +1478,23 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
         }
         if ((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing) < 5 || title == TXT_PRESSURE_IN)
         {
-            drawString(x_pos - 10, y_pos + gheight * spacing / y_minor_axis - 5, String((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing + 0.01), 1), RIGHT);
+            drawString(x_pos - 10, y_pos + gheight * spacing / y_minor_axis - 14, String((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing + 0.01), 1), RIGHT);
         }
         else
         {
             if (Y1Min < 1 && Y1Max < 10)
             {
-                drawString(x_pos - 3, y_pos + gheight * spacing / y_minor_axis - 5, String((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing + 0.01), 1), RIGHT);
+                drawString(x_pos - 3, y_pos + gheight * spacing / y_minor_axis - 14, String((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing + 0.01), 1), RIGHT);
             }
             else
             {
-                drawString(x_pos - 7, y_pos + gheight * spacing / y_minor_axis - 5, String((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing + 0.01), 0), RIGHT);
+                drawString(x_pos - 7, y_pos + gheight * spacing / y_minor_axis - 14, String((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing + 0.01), 0), RIGHT);
             }
         }
     }
     for (int i = 0; i < 3; i++)
     {
-        drawString(20 + x_pos + gwidth / 3 * i, y_pos + gheight + 10, String(i) + "d", LEFT);
+        drawString(20 + x_pos + gwidth / 3 * i, y_pos + gheight + 1, String(i) + "d", LEFT);
         if (i < 2)
             drawFastVLine(x_pos + gwidth / 3 * i + gwidth / 3, y_pos, gheight, LightGrey);
     }

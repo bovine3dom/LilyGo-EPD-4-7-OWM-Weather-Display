@@ -20,3 +20,24 @@
 
 Git ignores `.env`. The tracked `data/config.json` is a safe template. The build script writes a private SPIFFS copy under `.pio/fsdata`.
 
+## Refresh schedule
+
+The display updates every hour from 08:00 through 21:00 local time. The first successful update each day uses a full refresh. The 08:00 update also uses a full refresh. The display uses a full refresh after five partial updates.
+
+The battery voltage controls the update interval:
+
+| Battery voltage | Interval |
+| --- | --- |
+| 4.15 V or higher | 1 hour |
+| 3.95 V to less than 4.15 V | 6 hours |
+| 3.75 V to less than 3.95 V | 12 hours |
+| Less than 3.75 V | 24 hours |
+
+The longer intervals start at 08:00 each day. The voltage is an estimate.
+
+The `ntp.timezone` setting uses a POSIX time-zone string. The default `CET-1CEST,M3.5.0,M10.5.0/3` follows Central European summer time. The device applies the configured transition rules automatically.
+
+## Fonts
+
+The display uses [Spleen](https://github.com/fcambus/spleen) by Frederic Cambus. The licence is in `fonts/Spleen.LICENSE`. Run `python3 scripts/generate_spleen.py` to regenerate `fonts/spleen.h` from the pinned upstream revision.
+
