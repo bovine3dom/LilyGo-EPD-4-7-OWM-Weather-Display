@@ -93,13 +93,21 @@ float ReadBatteryVoltage()
 {
 #if CONFIG_IDF_TARGET_ESP32
     const uint8_t pin = 36;
+    const adc_unit_t unit = ADC_UNIT_1;
 #else
     const uint8_t pin = 14;
+    const adc_unit_t unit = ADC_UNIT_2;
 #endif
     analogSetPinAttenuation(pin, ADC_11db);
     esp_adc_cal_characteristics_t adc_chars;
-    esp_adc_cal_value_t calibration = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
-    float vref = calibration == ESP_ADC_CAL_VAL_EFUSE_VREF ? adc_chars.vref : 1100.0f;
+    esp_adc_cal_value_t calibration = esp_adc_cal_characterize(unit, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
+    if (calibration == ESP_ADC_CAL_VAL_NOT_SUPPORTED)
+    {
+        Serial.println("Battery ADC calibration unavailable");
+        return 0.0f;
+    }
+    epd_poweron();
+    delay(10);
     uint32_t raw = 0;
     for (int sample = 0; sample < 8; ++sample)
     {
@@ -107,8 +115,9 @@ float ReadBatteryVoltage()
         delay(2);
     }
     uint32_t averageRaw = raw / 8;
-    float voltage = averageRaw / 4096.0f * 6.566f * (vref / 1000.0f);
-    Serial.printf("Battery ADC raw %u -> %.2f V\n", averageRaw, voltage);
+    epd_poweroff_all();
+    float voltage = esp_adc_cal_raw_to_voltage(averageRaw, &adc_chars) * 2.0f / 1000.0f;
+    Serial.printf("Battery ADC raw %u, calibration %d -> %.3f V\n", averageRaw, (int)calibration, voltage);
     return voltage >= 1.0f && voltage <= 5.0f ? voltage : 0.0f;
 }
 
@@ -142,7 +151,7 @@ void UpdateBatteryLifeEstimate(time_t now)
         return;
 
     Preferences prefs;
-    if (!prefs.begin("battlife", false))
+    if (!prefs.begin("battlife2", false))
         return;
     float anchorPercent = prefs.getFloat("anchor_pct", -1.0f);
     time_t anchorTime = (time_t)prefs.getULong64("anchor_time", 0);
@@ -164,7 +173,7 @@ void UpdateBatteryLifeEstimate(time_t now)
         drainPercentPerDay = 0.0f;
         save = true;
     }
-    else if (anchorPercent - percent >= 3.0f && now - anchorTime >= 86400)
+    else if (anchorPercent - percent >= 1.0f && now - anchorTime >= 3600)
     {
         float observedRate = (anchorPercent - percent) * 86400.0f / difftime(now, anchorTime);
         drainPercentPerDay = drainPercentPerDay > 0.0f ? (drainPercentPerDay + observedRate) / 2.0f : observedRate;
