@@ -59,6 +59,10 @@ void MarkWeatherSuccess(time_t) { ++successes; }
 void LoadFakeWeather(time_t) { ++fakeCalls; }
 bool obtainWeatherData(WiFiClient &, const char*) { ++apiCalls; return true; }
 bool FetchSnorkel(SnorkelData&) { ++snorkelCalls; return snorkelOk; }
+void FetchWeatherParallel(bool &current, bool &forecast, SnorkelData *snorkel) {
+    apiCalls += 2; current = forecast = true;
+    if (snorkel) FetchSnorkel(*snorkel);
+}
 void StopWiFi() {}
 void DisplayWeather() { ++renders; }
 bool UpdatePartialDisplay(uint8_t*, bool) { return displayOk; }

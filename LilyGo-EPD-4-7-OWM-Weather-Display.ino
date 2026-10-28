@@ -28,6 +28,7 @@
 #include "transitous.h"
 #include "rail.h"
 #include "snorkel.h"
+#include "weather_parallel.h"
 #include "graph_time.h"
 #include "button_icons.h"
 #include "lang.h"
@@ -904,19 +905,10 @@ void setup()
             wifiUsed = true;
             wifiConnected = StartWiFi() == WL_CONNECTED;
         }
-        if (wifiConnected)
-        {
-            byte Attempts = 1;
-            WiFiClient client;
-            while ((!RxWeather || !RxForecast) && Attempts <= 2)
-            {
-                if (!RxWeather) RxWeather = obtainWeatherData(client, "weather");
-                if (!RxForecast) RxForecast = obtainWeatherData(client, "forecast");
-                Attempts++;
-            }
-        }
+        if (wifiConnected) FetchWeatherParallel(RxWeather, RxForecast, SNORKEL_URL[0] ? &Snorkel : nullptr);
 #endif
     }
+#if DEBUG_FAKE_WEATHER
     if (updateDue && RxWeather && RxForecast && SNORKEL_URL[0])
     {
         if (!wifiConnected)
@@ -926,6 +918,7 @@ void setup()
         }
         if (wifiConnected) FetchSnorkel(Snorkel);
     }
+#endif
     if (wifiUsed) StopWiFi();
     if (updateDue && RxWeather && RxForecast)
     {
@@ -1102,11 +1095,10 @@ bool obtainWeatherData(WiFiClient &client, const String &RequestType)
     int httpCode = http.GET();
     if (httpCode == HTTP_CODE_OK)
     {
-        if (!DecodeWeather(http.getStream(), RequestType))
-            return false;
+        bool ok = DecodeWeather(http.getStream(), RequestType);
         client.stop();
         http.end();
-        return true;
+        return ok;
     }
     else
     {
