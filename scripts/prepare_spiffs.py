@@ -62,6 +62,9 @@ contact = secrets.get("TRANSITOUS_CONTACT", "")
 stop = secrets["TRAM_STOP_NAME"]
 rail_id = secrets.get("RAIL_STATION_ID", "")
 rail_name = secrets.get("RAIL_STATION_NAME", "")
+snorkel_url = secrets.get("SNORKEL_URL", "")
+if snorkel_url and (not snorkel_url.startswith(("http://", "https://")) or any(ord(c) < 32 for c in snorkel_url)):
+    raise RuntimeError("SNORKEL_URL must be a single-line HTTP or HTTPS URL.")
 if rail_id and (not rail_id.isascii() or not rail_id.isdecimal()):
     raise RuntimeError("RAIL_STATION_ID must contain digits only.")
 if any("\n" in value or "\r" in value for value in (contact, stop, rail_name)):
@@ -87,7 +90,7 @@ rail_title = rail_name.upper()
 if len(rail_title) > 8:
     rail_title = rail_title[:5] + "..."
 strings = {"TRANSITOUS_CONTACT": contact, "TRAM_STOP_NAME": stop, "TRAM_STOP_TITLE": title, "TRAM_STOP_BBOX": bbox,
-           "RAIL_STATION_ID": rail_id, "RAIL_STATION_TITLE": rail_title,
+           "RAIL_STATION_ID": rail_id, "RAIL_STATION_TITLE": rail_title, "SNORKEL_URL": snorkel_url,
            "WEATHER_CITY": secrets["WEATHER_CITY"], "WEATHER_COUNTRY": secrets["WEATHER_COUNTRY"]}
 header = "#pragma once\n" + "".join(f"#define {key} {json.dumps(value, ensure_ascii=False)}\n" for key, value in strings.items())
 header += (f"#define TRAM_STOP_LATITUDE {lat:.8f}\n#define TRAM_STOP_LONGITUDE {lon:.8f}\n"

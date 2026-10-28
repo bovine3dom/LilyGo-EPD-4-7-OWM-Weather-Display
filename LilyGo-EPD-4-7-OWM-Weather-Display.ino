@@ -17,6 +17,7 @@
 #include <Preferences.h>
 #include <SPI.h>  // In-built
 #include <time.h> // In-built
+#include <cmath>
 #include "SPIFFS.h"
 #include "FS.h"
 
@@ -26,6 +27,8 @@
 #include "partial_display.h"
 #include "transitous.h"
 #include "rail.h"
+#include "snorkel.h"
+#include "graph_time.h"
 #include "button_icons.h"
 #include "lang.h"
 
@@ -71,10 +74,9 @@ const int ForecastWidth = 90;
 
 Forecast_record_type WxConditions[1];
 Forecast_record_type WxForecast[max_readings];
+SnorkelData Snorkel;
 
-float pressure_readings[max_readings]    = {0};
 float temperature_readings[max_readings] = {0};
-float humidity_readings[max_readings]    = {0};
 float rain_readings[max_readings]        = {0};
 float snow_readings[max_readings]        = {0};
 
@@ -883,7 +885,12 @@ void setup()
         timeSynced = wifiConnected && SetupTime();
     }
     if (timeSynced) UpdateBatteryLifeEstimate(time(nullptr));
-    bool updateDue = timeSynced && IsScheduledUpdate() && ClaimWeatherAttempt(time(nullptr));
+    bool updateDue = timeSynced && IsScheduledUpdate() &&
+#if DEBUG_FAKE_WEATHER && DEBUG_SERIAL_WAKE_SECONDS > 0
+                     (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER || ClaimWeatherAttempt(time(nullptr)));
+#else
+                     ClaimWeatherAttempt(time(nullptr));
+#endif
     bool RxWeather = false, RxForecast = false;
     if (updateDue)
     {
@@ -909,6 +916,15 @@ void setup()
             }
         }
 #endif
+    }
+    if (updateDue && RxWeather && RxForecast && SNORKEL_URL[0])
+    {
+        if (!wifiConnected)
+        {
+            wifiUsed = true;
+            wifiConnected = StartWiFi() == WL_CONNECTED;
+        }
+        if (wifiConnected) FetchSnorkel(Snorkel);
     }
     if (wifiUsed) StopWiFi();
     if (updateDue && RxWeather && RxForecast)
@@ -1012,11 +1028,11 @@ bool DecodeWeather(WiFiClient &json, String Type)
         {
             Serial.println("\nPeriod-" + String(r) + "--------------");
             WxForecast[r].Dt = list[r]["dt"].as<int>();
-            WxForecast[r].Temperature = list[r]["main"]["temp"].as<float>();
+            WxForecast[r].Temperature = list[r]["main"]["temp"].is<float>() ? list[r]["main"]["temp"].as<float>() : NAN;
             Serial.println("Temp: " + String(WxForecast[r].Temperature));
-            WxForecast[r].Low = list[r]["main"]["temp_min"].as<float>();
+            WxForecast[r].Low = list[r]["main"]["temp_min"].is<float>() ? list[r]["main"]["temp_min"].as<float>() : NAN;
             Serial.println("TLow: " + String(WxForecast[r].Low));
-            WxForecast[r].High = list[r]["main"]["temp_max"].as<float>();
+            WxForecast[r].High = list[r]["main"]["temp_max"].is<float>() ? list[r]["main"]["temp_max"].as<float>() : NAN;
             Serial.println("THig: " + String(WxForecast[r].High));
             WxForecast[r].Pressure = list[r]["main"]["pressure"].as<float>();
             Serial.println("Pres: " + String(WxForecast[r].Pressure));
@@ -1162,22 +1178,22 @@ double NormalizedMoonPhase(int d, int m, int y)
 
 void DisplayWeather()
 {                                               // 4.7" e-paper display is 960x540 resolution
+    time_t displayedAt = time(nullptr);
     DrawButtonHints(WeatherPage);
     DisplayStatusSection(600, 20, wifi_signal); // Wi-Fi signal strength and Battery voltage
-    DisplayGeneralInfoSection();                // Top line of the display
+    DisplayGeneralInfoSection(displayedAt);     // Top line of the display
     DisplayDisplayWindSection(137, 150, WxConditions[0].Winddir, WxConditions[0].Windspeed, 100);
     DisplayAstronomySection(5, 255);     // Astronomy section Sun rise/set, Moon phase and Moon icon
     DisplayMainWeatherSection(320, 110); // Centre section of display for Location, temperature, Weather report, current Wx Symbol
     DisplayWeatherIcon(810, 130);        // Display weather icon    scale = Large;
-    DisplayForecastSection(320, 220);    // 3hr forecast boxes
+    DisplayForecastSection(320, 220, displayedAt); // 3hr forecast boxes
 }
 
-void DisplayGeneralInfoSection()
+void DisplayGeneralInfoSection(time_t now)
 {
     setFont(Spleen24Bold);
     drawString(5, 10, City, LEFT);
     setFont(Spleen24);
-    time_t now = time(nullptr);
     char updated[17] = "---------- --:--", next[6];
     if (now >= 1600000000)
     {
@@ -1338,12 +1354,15 @@ void DisplayPressureSection(int x, int y, float pressure, String slope)
 
 void DisplayForecastWeather(int x, int y, int index)
 {
+    if (WxForecast[index].Dt <= 0) return;
     int fwidth = ForecastWidth;
     x = x + fwidth * index;
     DisplayConditionsSection(x + fwidth / 2, y + 90, WxForecast[index].Icon, SmallIcon);
     setFont(Spleen24);
     drawString(x + fwidth / 2, y + 30, String(ConvertUnixTime(WxForecast[index].Dt).substring(0, 5)), CENTER);
-    drawString(x + fwidth / 2, y + 125, String(WxForecast[index].High, 0) + "°/" + String(WxForecast[index].Low, 0) + "°", CENTER);
+    String high = std::isfinite(WxForecast[index].High) ? String(WxForecast[index].High, 0) + "°" : "--";
+    String low = std::isfinite(WxForecast[index].Low) ? String(WxForecast[index].Low, 0) + "°" : "--";
+    drawString(x + fwidth / 2, y + 125, high + "/" + low, CENTER);
 }
 
 void DisplayAstronomySection(int x, int y)
@@ -1441,17 +1460,15 @@ String MoonPhase(int d, int m, int y, String hemisphere)
     return "";
 }
 
-void DisplayForecastSection(int x, int y)
+void DisplayForecastSection(int x, int y, time_t now)
 {
     for (int f = 0; f < max_readings && x + (f + 1) * ForecastWidth <= SCREEN_WIDTH; ++f)
         DisplayForecastWeather(x, y, f);
+    time_t weatherTimes[max_readings];
     int r = 0;
     do
     { // Pre-load temporary arrays with with data - because C parses by reference and remember that[1] has already been converted to I units
-        if (Units == "I")
-            pressure_readings[r] = WxForecast[r].Pressure * 0.02953;
-        else
-            pressure_readings[r] = WxForecast[r].Pressure;
+        weatherTimes[r] = WxForecast[r].Dt;
         if (Units == "I")
             rain_readings[r] = WxForecast[r].Rainfall * 0.0393701;
         else
@@ -1461,21 +1478,29 @@ void DisplayForecastSection(int x, int y)
         else
             snow_readings[r] = WxForecast[r].Snowfall;
         temperature_readings[r] = WxForecast[r].Temperature;
-        humidity_readings[r] = WxForecast[r].Humidity;
         r++;
     } while (r < max_readings);
     int gwidth = 175, gheight = 100;
     int gx = (SCREEN_WIDTH - gwidth * 4) / 5 + 8;
     int gy = (SCREEN_HEIGHT - gheight - 30);
     int gap = gwidth + gx;
-    // (x,y,width,height,MinValue, MaxValue, Title, Data Array, AutoScale, ChartMode)
-    DrawGraph(gx + 0 * gap, gy, gwidth, gheight, 900, 1050, Units == "M" ? TXT_PRESSURE_HPA : TXT_PRESSURE_IN, pressure_readings, max_readings, autoscale_on, barchart_off); // TODO: swap this for wave height or visibility
-    DrawGraph(gx + 1 * gap, gy, gwidth, gheight, 10, 30, Units == "M" ? TXT_TEMPERATURE_C : TXT_TEMPERATURE_F, temperature_readings, max_readings, autoscale_on, barchart_off);
-    DrawGraph(gx + 2 * gap, gy, gwidth, gheight, 0, 100, TXT_HUMIDITY_PERCENT, humidity_readings, max_readings, autoscale_off, barchart_off);
-    if (SumOfPrecip(rain_readings, max_readings) >= SumOfPrecip(snow_readings, max_readings))
-        DrawGraph(gx + 3 * gap + 5, gy, gwidth, gheight, 0, 30, Units == "M" ? TXT_RAINFALL_MM : TXT_RAINFALL_IN, rain_readings, max_readings, autoscale_on, barchart_on);
-    else
-        DrawGraph(gx + 3 * gap + 5, gy, gwidth, gheight, 0, 30, Units == "M" ? TXT_SNOWFALL_MM : TXT_SNOWFALL_IN, snow_readings, max_readings, autoscale_on, barchart_on);
+    float waves[SnorkelForecastMax], water[SnorkelForecastMax];
+    for (size_t i = 0; i < Snorkel.forecastCount; ++i)
+    {
+        waves[i] = Units == "M" ? Snorkel.waves[i] : Snorkel.waves[i] * 3.28084f;
+        water[i] = Units == "M" ? Snorkel.water[i] : Snorkel.water[i] * 1.8f + 32;
+    }
+    GraphSeries waveSeries{Snorkel.forecastTimes, waves, Snorkel.forecastCount, 4 * 3600 + 1800};
+    GraphSeries waterSeries{Snorkel.forecastTimes, water, Snorkel.forecastCount, 4 * 3600 + 1800};
+    GraphSeries airSeries{weatherTimes, temperature_readings, max_readings, 4 * 3600 + 1800};
+    GraphSeries niceSeries{Snorkel.jellyTimes, Snorkel.nice, Snorkel.jellyCount, 36 * 3600};
+    GraphSeries vfSeries{Snorkel.jellyTimes, Snorkel.vf, Snorkel.jellyCount, 36 * 3600};
+    bool rain = SumOfPrecip(rain_readings, max_readings) >= SumOfPrecip(snow_readings, max_readings);
+    GraphSeries precipSeries{weatherTimes, rain ? rain_readings : snow_readings, max_readings, 4 * 3600 + 1800};
+    DrawGraph(gx, gy, gwidth, gheight, 0, 2, Units == "M" ? "Wave height (m)" : "Wave height (ft)", waveSeries, autoscale_on, barchart_off, nullptr, false, false, now);
+    DrawGraph(gx + gap, gy, gwidth, gheight, 10, 30, Units == "M" ? TXT_TEMPERATURE_C : TXT_TEMPERATURE_F, airSeries, autoscale_on, barchart_off, &waterSeries, true, false, now);
+    DrawGraph(gx + 2 * gap, gy, gwidth, gheight, 0, 10, "jellies - nice -- vf", niceSeries, autoscale_on, barchart_off, &vfSeries, true, true, now);
+    DrawGraph(gx + 3 * gap + 5, gy, gwidth, gheight, 0, 30, rain ? (Units == "M" ? TXT_RAINFALL_MM : TXT_RAINFALL_IN) : (Units == "M" ? TXT_SNOWFALL_MM : TXT_SNOWFALL_IN), precipSeries, autoscale_on, barchart_on, nullptr, false, false, now);
 }
 
 void DisplayConditionsSection(int x, int y, String IconName, bool IconSize)
@@ -1947,66 +1972,94 @@ void Nodata(int x, int y, bool IconSize, String IconName)
     drawString(x - 3, y - 10, "?", CENTER);
 }
 
-/* (C) D L BIRD
-    This function will draw a graph on a ePaper/TFT/LCD display using data from an array containing data to be graphed.
-    The variable 'max_readings' determines the maximum number of data elements for each array. Call it with the following parametric data:
-    x_pos-the x axis top-left position of the graph
-    y_pos-the y-axis top-left position of the graph, e.g. 100, 200 would draw the graph 100 pixels along and 200 pixels down from the top-left of the screen
-    width-the width of the graph in pixels
-    height-height of the graph in pixels
-    Y1_Max-sets the scale of plotted data, for example 5000 would scale all data to a Y-axis of 5000 maximum
-    data_array1 is parsed by value, externally they can be called anything else, e.g. within the routine it is called data_array1, but externally could be temperature_readings
-    auto_scale-a logical value (TRUE or FALSE) that switches the Y-axis autoscale On or Off
-    barchart_on-a logical value (TRUE or FALSE) that switches the drawing mode between barhcart and line graph
-    barchart_colour-a sets the title and graph plotting colour
-    If called with Y!_Max value of 500 and the data never goes above 500, then autoscale will retain a 0-500 Y scale, if on, the scale increases/decreases to match the data.
-    auto_scale_margin, e.g. if set to 1000 then autoscale increments the scale by 1000 steps.
-*/
-void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float Y1Max, String title, float DataArray[], int readings, boolean auto_scale, boolean barchart_mode)
+int GraphY(float value, float low, float high, int y, int height)
 {
-#define auto_scale_margin 0 // Sets the autoscale increment, so axis steps up fter a change of e.g. 3
-#define y_minor_axis 5      // 5 y-axis division markers
-    setFont(Spleen24);
-    int maxYscale = -10000;
-    int minYscale = 10000;
-    int last_x, last_y;
-    float x2, y2;
-    if (auto_scale == true)
+    return y + (high - constrain(value, low, high)) / (high - low) * height + 1;
+}
+
+void PlotGraphSeries(const GraphSeries &series, time_t start, time_t end, int x_pos, int y_pos,
+                     int gwidth, int gheight, float low, float high, bool dashed, bool bars)
+{
+    time_t previousTime = 0;
+    float previousValue = 0;
+    for (size_t i = 0; i < series.count; ++i)
     {
-        for (int i = 1; i < readings; i++)
+        time_t current = series.times[i];
+        float value = series.values[i];
+        if (!current || !std::isfinite(value)) { previousTime = 0; continue; }
+        time_t left, right;
+        if (bars && ClipGraphTime(current - 3 * 3600, current, start, end, 3 * 3600, left, right))
         {
-            if (DataArray[i] >= maxYscale)
-                maxYscale = DataArray[i];
-            if (DataArray[i] <= minYscale)
-                minYscale = DataArray[i];
+            int x1 = GraphTimeX(left, start, end, x_pos, gwidth), x2 = GraphTimeX(right, start, end, x_pos, gwidth);
+            int y = GraphY(value, low, high, y_pos, gheight);
+            fillRect(x1 + 1, y, max(1, x2 - x1 - 1), y_pos + gheight - y + 2, Black);
         }
-        maxYscale = round(maxYscale + auto_scale_margin); // Auto scale the graph and round to the nearest value defined, default was Y1Max
-        Y1Max = round(maxYscale + 0.5);
-        if (minYscale != 0)
-            minYscale = round(minYscale - auto_scale_margin); // Auto scale the graph and round to the nearest value defined, default was Y1Min
-        Y1Min = round(minYscale);
+        else if (!bars)
+        {
+            if (previousTime && ClipGraphTime(previousTime, current, start, end, series.maxGap, left, right))
+            {
+                float span = difftime(current, previousTime);
+                float v1 = previousValue + (value - previousValue) * difftime(left, previousTime) / span;
+                float v2 = previousValue + (value - previousValue) * difftime(right, previousTime) / span;
+                int x1 = GraphTimeX(left, start, end, x_pos, gwidth), x2 = GraphTimeX(right, start, end, x_pos, gwidth);
+                int y1 = GraphY(v1, low, high, y_pos, gheight), y2 = GraphY(v2, low, high, y_pos, gheight);
+                int dash = dashed ? 8 : x2 - x1;
+                for (int x = x1; x < x2; x += dash)
+                {
+                    int xEnd = min(x + (dashed ? 4 : dash), x2);
+                    int y = y1 + (y2 - y1) * (x - x1) / (x2 - x1);
+                    int yEnd = y1 + (y2 - y1) * (xEnd - x1) / (x2 - x1);
+                    drawLine(x, y - 1, xEnd, yEnd - 1, Black);
+                    drawLine(x, y, xEnd, yEnd, Black);
+                }
+            }
+            if (current >= start && current <= end)
+            {
+                int x = GraphTimeX(current, start, end, x_pos, gwidth), y = GraphY(value, low, high, y_pos, gheight);
+                drawPixel(x, y - 1, Black);
+                drawPixel(x, y, Black);
+            }
+        }
+        previousTime = current;
+        previousValue = value;
     }
-    // Draw the graph
-    last_x = x_pos + 1;
-    last_y = y_pos + (Y1Max - constrain(DataArray[1], Y1Min, Y1Max)) / (Y1Max - Y1Min) * gheight;
+}
+
+void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float Y1Max, String title,
+               const GraphSeries &primary, boolean auto_scale, boolean barchart_mode,
+               const GraphSeries *overlay, bool dashed, bool history, time_t now)
+{
+#define y_minor_axis 5
+    setFont(Spleen24);
+    time_t start = history ? now - 3 * 86400 : now, end = start + 3 * 86400;
+    float minValue = INFINITY, maxValue = -INFINITY;
+    bool haveData = false;
+    for (const GraphSeries *series : {&primary, overlay})
+    {
+        if (!series) continue;
+        for (size_t i = 0; i < series->count; ++i)
+        {
+            time_t t = series->times[i];
+            float value = series->values[i];
+            if (t <= 0 || !std::isfinite(value)) continue;
+            bool visible = t >= start && t <= end;
+            if (series == &primary && barchart_mode) visible = t > start && t - 3 * 3600 < end;
+            haveData |= visible;
+            if (t >= start - series->maxGap && t <= end + series->maxGap)
+            {
+                minValue = min(minValue, value);
+                maxValue = max(maxValue, value);
+            }
+        }
+    }
+    if (auto_scale && haveData) { Y1Min = floorf(minValue); Y1Max = ceilf(maxValue); }
+    if (history) Y1Min = 0;
+    if (Y1Max <= Y1Min) Y1Max = Y1Min + 1;
     drawRect(x_pos, y_pos, gwidth + 3, gheight + 2, Grey);
     drawString(x_pos - 20 + gwidth / 2, y_pos - 34, title, CENTER);
-    for (int gx = 0; gx < readings; gx++)
-    {
-        x2 = x_pos + gx * gwidth / (readings - 1) - 1; // max_readings is the global variable that sets the maximum data that can be plotted
-        y2 = y_pos + (Y1Max - constrain(DataArray[gx], Y1Min, Y1Max)) / (Y1Max - Y1Min) * gheight + 1;
-        if (barchart_mode)
-        {
-            fillRect(last_x + 2, y2, (gwidth / readings) - 1, y_pos + gheight - y2 + 2, Black);
-        }
-        else
-        {
-            drawLine(last_x, last_y - 1, x2, y2 - 1, Black); // Two lines for hi-res display
-            drawLine(last_x, last_y, x2, y2, Black);
-        }
-        last_x = x2;
-        last_y = y2;
-    }
+    if (!haveData) drawString(x_pos + gwidth / 2, y_pos + gheight / 2 - 12, "--", CENTER);
+    if (overlay) PlotGraphSeries(*overlay, start, end, x_pos, y_pos, gwidth, gheight, Y1Min, Y1Max, dashed, false);
+    PlotGraphSeries(primary, start, end, x_pos, y_pos, gwidth, gheight, Y1Min, Y1Max, false, barchart_mode);
     //Draw the Y-axis scale
 #define number_of_dashes 20
     for (int spacing = 0; spacing <= y_minor_axis; spacing++)
@@ -2016,7 +2069,12 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
             if (spacing < y_minor_axis)
                 drawFastHLine((x_pos + 3 + j * gwidth / number_of_dashes), y_pos + (gheight * spacing / y_minor_axis), gwidth / (2 * number_of_dashes), Grey);
         }
-        if ((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing) < 5 || title == TXT_PRESSURE_IN)
+        if (history)
+        {
+            float value = Y1Max - (Y1Max - Y1Min) / y_minor_axis * spacing;
+            drawString(x_pos - 10, y_pos + gheight * spacing / y_minor_axis - 14, String(value + 0.01f, Y1Max < 10 ? 1 : 0), RIGHT);
+        }
+        else if ((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing) < 5 || title == TXT_PRESSURE_IN)
         {
             drawString(x_pos - 10, y_pos + gheight * spacing / y_minor_axis - 14, String((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing + 0.01), 1), RIGHT);
         }
@@ -2032,11 +2090,11 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
             }
         }
     }
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i <= 3; i++)
     {
-        drawString(20 + x_pos + gwidth / 3 * i, y_pos + gheight + 1, String(i) + "d", LEFT);
-        if (i < 2)
-            drawFastVLine(x_pos + gwidth / 3 * i + gwidth / 3, y_pos, gheight, LightGrey);
+        int x = x_pos + gwidth * i / 3;
+        drawString(x, y_pos + gheight + 1, String(history ? i - 3 : i) + "d", i == 0 ? LEFT : i == 3 ? RIGHT : CENTER);
+        if (i > 0 && i < 3) drawFastVLine(x, y_pos, gheight, LightGrey);
     }
 }
 

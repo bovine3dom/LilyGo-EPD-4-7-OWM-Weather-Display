@@ -19,7 +19,7 @@ with tempfile.TemporaryDirectory() as directory:
                                'WEATHER_CITY="Exampleville"\nWEATHER_COUNTRY="GB"\nTRANSITOUS_CONTACT="contact@example.org"\n'
                                'TRAM_STOP_NAME="Sample Stop"\nTRAM_STOP_LATITUDE="51.5"\nTRAM_STOP_LONGITUDE="-0.12"\n'
                                'TRAM_MINIMUM_MINUTES="17"\nRAIL_STATION_ID="0012345678"\nRAIL_STATION_NAME="Example Station"\n'
-                               'RAIL_MINIMUM_MINUTES="21"\n'
+                               'RAIL_MINIMUM_MINUTES="21"\nSNORKEL_URL="http://192.0.2.1:53113/data"\n'
                                'DEBUG_FAKE_WEATHER="1"\nDEBUG_SERIAL_WAKE_SECONDS="30"\n')
 
     class Env:
@@ -34,6 +34,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert '"contact@example.org"' in header and '"Sample Stop"' in header
     assert '#define TRAM_MINIMUM_SECONDS 1020' in header and '#define RAIL_MINIMUM_SECONDS 1260' in header
     assert '#define RAIL_STATION_ID "0012345678"' in header and '#define RAIL_STATION_TITLE "EXAMP..."' in header
+    assert '#define SNORKEL_URL "http://192.0.2.1:53113/data"' in header
     assert '#define DEBUG_FAKE_WEATHER 1' in header and '#define DEBUG_SERIAL_WAKE_SECONDS 30' in header
     assert config["OpenWeather"]["city"] == "Exampleville" and config["OpenWeather"]["country"] == "GB"
     assert "Transitous" not in json.loads((root / "data" / "config.json").read_text())

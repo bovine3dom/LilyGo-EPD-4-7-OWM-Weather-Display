@@ -14,11 +14,11 @@
 ## Private build settings
 
 1. Copy `.env.example` to `.env`.
-2. Set the Wi-Fi, OpenWeather, weather location, Transitous contact, tram stop and walking-time fields in `.env`.
+2. Set the Wi-Fi, OpenWeather, weather location, Transitous contact, tram stop and walking-time fields in `.env`. Set `SNORKEL_URL` to the snorkel board's `/data` URL.
 3. Build and upload firmware with `pio run -e T5_4_7Inc_Plus_V2 -t upload`.
 4. Upload the generated SPIFFS settings with `pio run -e T5_4_7Inc_Plus_V2 -t uploadfs`.
 
-Git ignores `.env`. The build script writes private settings under `.pio`. The firmware contains the configured location and Transitous contact. Share firmware images with care.
+Git ignores `.env`. The build script writes private settings under `.pio`. The firmware contains the configured location, service URL and Transitous contact. Share firmware images with care. HTTPS uses the ISRG Root X1 certificate.
 
 ## Debug settings
 
@@ -32,16 +32,17 @@ Transit data is from [Transitous sources](https://transitous.org/sources/).
 
 The display updates every hour from 08:00 through 21:00 local time. The first successful update each day uses a full refresh. The 08:00 update also uses a full refresh. The display uses a full refresh after five partial updates.
 
-The battery voltage controls the update interval:
+The estimated battery charge controls the update interval:
 
-| Battery voltage | Interval |
+| Estimated charge | Interval |
 | --- | --- |
-| 4.15 V or higher | 1 hour |
-| 3.95 V to less than 4.15 V | 6 hours |
-| 3.75 V to less than 3.95 V | 12 hours |
-| Less than 3.75 V | 24 hours |
+| 51–100% | 1 hour |
+| 26–50% | 2 hours |
+| 13–25% | 4 hours |
+| 7–12% | 8 hours |
+| 0–6% | Once daily at 08:00 |
 
-The longer intervals start at 08:00 each day. The voltage is an estimate.
+The longer intervals start at 08:00 each day. The charge is an estimate.
 
 The `ntp.timezone` setting uses a POSIX time-zone string. The default `CET-1CEST,M3.5.0,M10.5.0/3` follows Central European summer time. The device applies the configured transition rules automatically.
 

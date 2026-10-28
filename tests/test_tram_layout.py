@@ -70,6 +70,37 @@ assert 568 < 601 - 6 and 760 + 37 < 800
 assert 601 + 42 < 675 - 6 and 675 + 42 < 760 - 6
 assert 833 + 9 * len("4.3v 99d23:59") <= 960
 assert 'setFont(Battery18)' in source
+# Graph titles and historical ticks fit between adjacent graphs and the screen edge.
+assert '"Wave height (m)"' in source and '"jellies - nice -- vf"' in source
+assert '&waterSeries, true, false, now)' in source
+assert '&vfSeries, true, true, now)' in source
+assert 'String(value + 0.01f, Y1Max < 10 ? 1 : 0), RIGHT)' in source
+graph_width, graph_height = 175, 100
+graph_x = (960 - graph_width * 4) // 5 + 8
+graph_y = 540 - graph_height - 30
+gap = graph_x + graph_width
+assert graph_x + gap + graph_width + 3 < graph_x + 2 * gap - 10 - measure("Spleen24", "400")[0]
+for wave, temp, precip in (("Wave height (m)", "Temperature (°C)", "Rainfall (mm)"),
+                           ("Wave height (ft)", "Temperature (°F)", "Snowfall (in)")):
+    titles = (wave, temp, "jellies - nice -- vf", precip)
+    previous_right = 0
+    for index, title in enumerate(titles):
+        width, height = measure("Spleen24", title)
+        center = graph_x + index * gap + (5 if index == 3 else 0) - 20 + graph_width // 2
+        assert previous_right < center - width // 2 and center + (width + 1) // 2 < 960
+        assert graph_y - 34 + height < graph_y
+        previous_right = center + (width + 1) // 2
+for graph in range(4):
+    previous_right = 0
+    left = graph_x + graph * gap + (5 if graph == 3 else 0)
+    for index in range(4):
+        label = f"{index - 3 if graph == 2 else index}d"
+        width, height = measure("Spleen24", label)
+        anchor = left + graph_width * index // 3
+        x = anchor if index == 0 else anchor - width if index == 3 else anchor - width // 2
+        assert previous_right <= x and left <= x and x + width <= left + graph_width
+        assert graph_y + graph_height + 1 + height <= 540
+        previous_right = x + width
 for row in range(10):
     y = 73 + row * 48
     assert y + measure("Spleen24", "Cancelled")[1] <= 540
