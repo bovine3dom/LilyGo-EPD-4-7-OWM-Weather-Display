@@ -18,14 +18,16 @@ def measure(font, text):
         return glyphs[code - 32 if code < 127 else 95 + code - 160]
     return sum(glyph(c)[2] for c in text), max(glyph(c)[1] for c in text)
 
-assert 'drawString(410, 16, updated, LEFT)' in page
+assert page.count('drawString(940, 16, updated, RIGHT)') == 2
+assert page.count('FormatClock(updatedAt, updated, sizeof(updated), true)') == 2
 assert 'int y = 73 + i * 57;' in page
 assert 'drawString(480 + j * 95, y, groups[i].times[j], LEFT)' in page
 assert 'TramGroup groups[8]' in page and 'FetchTransitous(rows, 32, count)' in source
 assert 'drawString(20, 16, TRAM_STOP_TITLE, LEFT)' in page
-assert 20 + measure("Spleen24Bold", "X" * 32)[0] < 410
-assert 410 + measure("Spleen24", "23:59")[0] < 960
-assert 16 + measure("Spleen24", "23:59")[1] < 55 < 73
+assert 20 + measure("Spleen24Bold", "X" * 32)[0] < 601 - 6
+assert 760 + 37 < 940 - measure("Spleen24", "23:59:59")[0]
+assert 940 <= 960
+assert 16 + measure("Spleen24", "23:59:59")[1] < 55 < 73
 assert 24 + measure("Spleen32", "L12345")[0] < 130
 assert 130 + measure("Spleen32", "X" * 20)[0] < 480
 for column in range(5):
@@ -52,7 +54,6 @@ assert 'drawString(940, 16, updated, RIGHT)' in rail
 assert '"Destination"' not in rail
 assert 20 + measure("Spleen24Bold", "X" * 8 + " - DEPARTURES")[0] < 324
 assert '"Platform"' not in rail
-assert 760 + 37 < 940 - measure("Spleen24", "23:59")[0]
 assert 'if (platform.length() > 30)' in rail
 assert 'FitTramDestination(rows[i].destination, 24)' in rail
 assert 24 + measure("Spleen24", "X" * 24)[0] < 324
@@ -61,7 +62,10 @@ assert 445 + measure("Spleen24", "Cancelled")[0] < 570
 assert 570 + measure("Spleen24", "X" * 30)[0] <= 960
 assert 16 + measure("Spleen24", "Scheduled")[1] < 55 < 73
 assert 10 + measure("Spleen24Bold", "X" * 8)[1] <= 150 - 101  # Weather header above compass.
-assert 190 + measure("Spleen24", "Wed, 28 Oct 2026 @ 23:59:59")[0] < 544
+assert 'drawString(190, 10, String(updated) + " | " + next, LEFT)' in source
+assert 5 + measure("Spleen24Bold", "X" * 12)[0] < 190
+assert 'strftime(updated, sizeof(updated), "%Y-%m-%d %H:%M", &localTime)' in source
+assert 190 + measure("Spleen24", "2026-10-28 23:59 | 08:00")[0] < 544
 assert 568 < 601 - 6 and 760 + 37 < 800
 assert 601 + 42 < 675 - 6 and 675 + 42 < 760 - 6
 assert 833 + 9 * len("4.3v 99d23:59") <= 960

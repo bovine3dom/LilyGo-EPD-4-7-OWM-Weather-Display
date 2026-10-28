@@ -26,12 +26,15 @@ harness = r'''
 #include <cstdlib>
 #include <ctime>
 #include <cstdio>
+#include <cstring>
+#include <cmath>
 #include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
 using std::min;
 using std::max;
+template<class T> T constrain(T value, T low, T high) { return min(high, max(low, value)); }
 #define DEBUG_FAKE_WEATHER 0
 std::map<std::string, uint64_t> saved;
 bool prefOk = true;
@@ -51,8 +54,8 @@ int wakeCause = ESP_SLEEP_WAKEUP_TIMER;
 int esp_sleep_get_wakeup_cause() { return wakeCause; }
 '''
 harness += "\n".join(function(signature) for signature in (
-    "int BatteryUpdateInterval(", "bool IsWeatherHour(", "bool IsScheduledUpdate(", "long SecondsUntilNextUpdate(",
-    "long NextSleepSeconds(", "uint32_t WeatherSlot(", "const char *WeatherScheduleNamespace(",
+    "uint8_t BatteryPercentage(", "int BatteryIntervalForPercentage(", "int BatteryUpdateInterval(", "bool IsWeatherHour(", "bool IsScheduledUpdate(", "long SecondsUntilNextUpdate(",
+    "long NextSleepSeconds(", "void FormatClock(", "uint32_t WeatherSlot(", "const char *WeatherScheduleNamespace(",
     "bool ClaimWeatherAttempt(", "void MarkWeatherSuccess(", "long WeatherRetrySeconds(", "float SumOfPrecip("
 ))
 harness += r'''
@@ -71,13 +74,16 @@ int main() {
     localtime_r(&transition, &before); transition += 60; localtime_r(&transition, &after);
     assert(before.tm_hour == 2 && before.tm_min == 59 && before.tm_isdst > 0);
     assert(after.tm_hour == 2 && after.tm_min == 0 && after.tm_isdst == 0);
+    const int percentages[] = {100, 51, 50, 26, 25, 13, 12, 7, 6, 3, 0};
+    const int intervals[] =   {  1,  1,  2,  2,  4,  4,  8, 8, 16, 16, 16};
+    for (size_t i = 0; i < sizeof(percentages) / sizeof(*percentages); ++i)
+        assert(BatteryIntervalForPercentage(percentages[i]) == intervals[i]);
+    for (int mv = 3500; mv <= 4200; ++mv) {
+        float voltage = mv / 1000.0f;
+        assert(BatteryUpdateInterval(voltage) == BatteryIntervalForPercentage(BatteryPercentage(voltage)));
+    }
     assert(BatteryUpdateInterval(4.20f) == 1);
-    assert(BatteryUpdateInterval(4.15f) == 1);
-    assert(BatteryUpdateInterval(4.14f) == 6);
-    assert(BatteryUpdateInterval(3.95f) == 6);
-    assert(BatteryUpdateInterval(3.94f) == 12);
-    assert(BatteryUpdateInterval(3.75f) == 12);
-    assert(BatteryUpdateInterval(3.74f) == 24);
+    assert(BatteryUpdateInterval(3.50f) == 16);
     assert(BatteryUpdateInterval(0.0f) == 1);
     float rain[25]; for (int i = 0; i < 24; ++i) rain[i] = 1; rain[24] = 1000;
     assert(SumOfPrecip(rain, 24) == 24);
@@ -89,6 +95,14 @@ int main() {
     CurrentHour = 12; CurrentMin = 2; assert(IsScheduledUpdate());
     wakeCause = 0; CurrentHour = 23; assert(IsScheduledUpdate());
     wakeCause = ESP_SLEEP_WAKEUP_TIMER; CurrentMin = 0;
+    for (int interval : {2, 4, 6, 8, 12, 16, 24}) {
+        UpdateIntervalHours = interval;
+        for (int hour = 0; hour < 24; ++hour) {
+            CurrentHour = hour;
+            assert(IsScheduledUpdate() == (hour >= 8 && hour <= 21 && (hour - 8) % interval == 0));
+        }
+        assert(SecondsUntilNextUpdate(local(2027, 1, 1, 7, 0)) == 3600 + 30);
+    }
     UpdateIntervalHours = 6;
     for (int hour = 0; hour < 24; ++hour) {
         CurrentHour = hour;
@@ -96,6 +110,11 @@ int main() {
     }
     assert(SecondsUntilNextUpdate(local(2027, 1, 1, 8, 0)) == 6 * 3600 + 30);
     assert(SecondsUntilNextUpdate(local(2027, 1, 1, 20, 0)) == 12 * 3600 + 30);
+    UpdateIntervalHours = 8;
+    assert(SecondsUntilNextUpdate(local(2027, 1, 1, 8, 0)) == 8 * 3600 + 30);
+    assert(SecondsUntilNextUpdate(local(2027, 1, 1, 16, 0)) == 16 * 3600 + 30);
+    UpdateIntervalHours = 16;
+    assert(SecondsUntilNextUpdate(local(2027, 1, 1, 8, 0)) == 24 * 3600 + 30);
     UpdateIntervalHours = 12;
     assert(SecondsUntilNextUpdate(local(2027, 1, 1, 8, 0)) == 12 * 3600 + 30);
     UpdateIntervalHours = 24;
@@ -106,6 +125,16 @@ int main() {
     assert(SecondsUntilNextUpdate(local(2027, 1, 1, 21, 0)) == 11 * 3600 + 30);
     assert(SecondsUntilNextUpdate(local(2027, 3, 27, 21, 0)) == 10 * 3600 + 30);
     assert(SecondsUntilNextUpdate(local(2027, 10, 30, 21, 0)) == 12 * 3600 + 30);
+    char clock[9];
+    FormatClock(0, clock, sizeof(clock), true); assert(!strcmp(clock, "--:--:--"));
+    FormatClock(0, clock, sizeof(clock), false); assert(!strcmp(clock, "--:--"));
+    time_t when = local(2027, 1, 1, 21, 0);
+    FormatClock(when, clock, sizeof(clock), true); assert(!strcmp(clock, "21:00:00"));
+    FormatClock(when + SecondsUntilNextUpdate(when), clock, sizeof(clock), false); assert(!strcmp(clock, "08:00"));
+    when = local(2027, 3, 27, 21, 0);
+    FormatClock(when + SecondsUntilNextUpdate(when), clock, sizeof(clock), false); assert(!strcmp(clock, "08:00"));
+    when = local(2027, 10, 30, 21, 0);
+    FormatClock(when + SecondsUntilNextUpdate(when), clock, sizeof(clock), false); assert(!strcmp(clock, "08:00"));
     time_t now = local(2027, 1, 1, 8, 5);
     assert(ClaimWeatherAttempt(now));
     assert(!ClaimWeatherAttempt(now + 30));

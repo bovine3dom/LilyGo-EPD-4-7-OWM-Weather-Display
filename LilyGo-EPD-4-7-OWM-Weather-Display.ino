@@ -58,9 +58,7 @@ boolean LargeIcon = true;
 boolean SmallIcon = false;
 #define Large 20 // For icon drawing
 #define Small 8  // For icon drawing
-String Time_str = "--:--:--";
-String Date_str = "-- --- ----";
-int wifi_signal, CurrentHour = 0, CurrentMin = 0, CurrentSec = 0, EventCnt = 0;
+int wifi_signal, CurrentHour = 0, EventCnt = 0;
 RTC_DATA_ATTR bool WiFiConnectionFailed = false;
 RTC_DATA_ATTR char CachedWiFiSSID[33] = {};
 RTC_DATA_ATTR uint8_t CachedWiFiBSSID[6] = {};
@@ -80,7 +78,7 @@ float humidity_readings[max_readings]    = {0};
 float rain_readings[max_readings]        = {0};
 float snow_readings[max_readings]        = {0};
 
-// Refresh from 08:00 through 21:00. Battery tiers use 1, 6, 12, or 24 hours.
+// Refresh from 08:00 through 21:00, with longer intervals as voltage falls.
 const int WakeupHour = 8;
 const int SleepHour = 21;
 int UpdateIntervalHours = 1;
@@ -141,17 +139,6 @@ float ReadBatteryVoltage()
     return voltage >= 1.0f && voltage <= 5.0f ? voltage : 0.0f;
 }
 
-int BatteryUpdateInterval(float voltage)
-{
-    if (!(voltage >= 1.0f && voltage <= 5.0f) || voltage >= 4.15f)
-        return 1;
-    if (voltage >= 3.95f)
-        return 6;
-    if (voltage >= 3.75f)
-        return 12;
-    return 24;
-}
-
 uint8_t BatteryPercentage(float voltage)
 {
     if (voltage >= 4.20f)
@@ -161,6 +148,21 @@ uint8_t BatteryPercentage(float voltage)
     float percentage = 2836.9625f * powf(voltage, 4) - 43987.4889f * powf(voltage, 3) +
                        255233.8134f * powf(voltage, 2) - 656689.7123f * voltage + 632041.7303f;
     return (uint8_t)constrain((int)lroundf(percentage), 0, 100);
+}
+
+int BatteryIntervalForPercentage(uint8_t percent)
+{
+    if (percent > 50) return 1;
+    if (percent > 25) return 2;
+    if (percent > 12) return 4;
+    if (percent > 6) return 8;
+    return 16;
+}
+
+int BatteryUpdateInterval(float voltage)
+{
+    if (!(voltage >= 1.0f && voltage <= 5.0f)) return 1;
+    return BatteryIntervalForPercentage(BatteryPercentage(voltage));
 }
 
 void UpdateBatteryLifeEstimate(time_t now)
@@ -527,21 +529,28 @@ String FitTramDestination(const char *destination, int limit = 20)
     return text;
 }
 
+void FormatClock(time_t when, char *output, size_t size, bool seconds)
+{
+    if (when <= 0)
+        snprintf(output, size, "%s", seconds ? "--:--:--" : "--:--");
+    else
+    {
+        struct tm localTime;
+        localtime_r(&when, &localTime);
+        strftime(output, size, seconds ? "%H:%M:%S" : "%H:%M", &localTime);
+    }
+}
+
 void DisplayTramBoard(const TramDeparture *rows, size_t count, time_t updatedAt, bool ok)
 {
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
     DrawButtonHints(TramPage);
     setFont(Spleen24Bold);
     drawString(20, 16, TRAM_STOP_TITLE, LEFT);
-    char updated[6] = "--:--";
-    if (updatedAt)
-    {
-        struct tm localTime;
-        localtime_r(&updatedAt, &localTime);
-        strftime(updated, sizeof(updated), "%H:%M", &localTime);
-    }
+    char updated[9];
+    FormatClock(updatedAt, updated, sizeof(updated), true);
     setFont(Spleen24);
-    drawString(410, 16, updated, LEFT);
+    drawString(940, 16, updated, RIGHT);
     drawFastHLine(20, 55, 920, Black);
     setFont(Spleen32);
     TramGroup groups[8] = {};
@@ -565,13 +574,8 @@ void DisplayRailBoard(const RailDeparture *rows, size_t count, time_t updatedAt,
     DrawButtonHints(RailPage);
     setFont(Spleen24Bold);
     drawString(20, 16, String(RAIL_STATION_TITLE) + " - DEPARTURES", LEFT);
-    char updated[6] = "--:--";
-    if (updatedAt)
-    {
-        struct tm localTime;
-        localtime_r(&updatedAt, &localTime);
-        strftime(updated, sizeof(updated), "%H:%M", &localTime);
-    }
+    char updated[9];
+    FormatClock(updatedAt, updated, sizeof(updated), true);
     setFont(Spleen24);
     drawString(324, 16, "Scheduled", LEFT);
     drawString(445, 16, "Expected", LEFT);
@@ -1173,7 +1177,16 @@ void DisplayGeneralInfoSection()
     setFont(Spleen24Bold);
     drawString(5, 10, City, LEFT);
     setFont(Spleen24);
-    drawString(190, 10, Date_str + " @ " + Time_str, LEFT);
+    time_t now = time(nullptr);
+    char updated[17] = "---------- --:--", next[6];
+    if (now >= 1600000000)
+    {
+        struct tm localTime;
+        localtime_r(&now, &localTime);
+        strftime(updated, sizeof(updated), "%Y-%m-%d %H:%M", &localTime);
+    }
+    FormatClock(now >= 1600000000 ? now + SecondsUntilNextUpdate(now) : 0, next, sizeof(next), false);
+    drawString(190, 10, String(updated) + " | " + next, LEFT);
 }
 
 void DisplayWeatherIcon(int x, int y)
@@ -1586,31 +1599,13 @@ void DrawRSSI(int x, int y, int rssi)
 boolean UpdateLocalTime()
 {
     struct tm timeinfo;
-    char time_output[30], day_output[30], update_time[30];
     while (!getLocalTime(&timeinfo, 5000))
     { // Wait for 5-sec for time to synchronise
         Serial.println("Failed to obtain time");
         return false;
     }
     CurrentHour = timeinfo.tm_hour;
-    CurrentMin = timeinfo.tm_min;
-    CurrentSec = timeinfo.tm_sec;
-    //See http://www.cplusplus.com/reference/ctime/strftime/
-    Serial.println(&timeinfo, "%a %b %d %Y   %H:%M:%S"); // Displays: Saturday, June 24 2017 14:05:49
-    if (Units == "M")
-    {
-        sprintf(day_output, "%s, %02u %s %04u", weekday_D[timeinfo.tm_wday], timeinfo.tm_mday, month_M[timeinfo.tm_mon], (timeinfo.tm_year) + 1900);
-        strftime(update_time, sizeof(update_time), "%H:%M:%S", &timeinfo); // Creates: '@ 14:05:49'   and change from 30 to 8 <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-        sprintf(time_output, "%s", update_time);
-    }
-    else
-    {
-        strftime(day_output, sizeof(day_output), "%a %b-%d-%Y", &timeinfo); // Creates  'Sat May-31-2019'
-        strftime(update_time, sizeof(update_time), "%r", &timeinfo);        // Creates: '@ 02:05:49pm'
-        sprintf(time_output, "%s", update_time);
-    }
-    Date_str = day_output;
-    Time_str = time_output;
+    Serial.println(&timeinfo, "%a %b %d %Y   %H:%M:%S");
     return true;
 }
 
