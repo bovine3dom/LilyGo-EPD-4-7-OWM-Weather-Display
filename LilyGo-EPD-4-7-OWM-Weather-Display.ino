@@ -29,6 +29,7 @@
 #include "rail.h"
 #include "snorkel.h"
 #include "weather_parallel.h"
+#include "battery_history.h"
 #include "graph_time.h"
 #include "button_icons.h"
 #include "lang.h"
@@ -142,82 +143,54 @@ float ReadBatteryVoltage()
     return voltage >= 1.0f && voltage <= 5.0f ? voltage : 0.0f;
 }
 
-uint8_t BatteryPercentage(float voltage)
+float BatteryCurvePercentage(float voltage)
 {
-    if (voltage >= 4.20f)
-        return 100;
-    if (voltage <= 3.50f)
-        return 0;
-    float percentage = 2836.9625f * powf(voltage, 4) - 43987.4889f * powf(voltage, 3) +
-                       255233.8134f * powf(voltage, 2) - 656689.7123f * voltage + 632041.7303f;
-    return (uint8_t)constrain((int)lroundf(percentage), 0, 100);
+    return 2836.9625f * powf(voltage, 4) - 43987.4889f * powf(voltage, 3) +
+           255233.8134f * powf(voltage, 2) - 656689.7123f * voltage + 632041.7303f;
 }
 
-int BatteryIntervalForPercentage(uint8_t percent)
+uint8_t BatteryPercentage(float voltage)
 {
-    if (percent > 50) return 1;
-    if (percent > 25) return 2;
-    if (percent > 12) return 4;
-    if (percent > 6) return 8;
-    return 16;
+    const float floor = BATTERY_FLOOR_MV / 1000.0f;
+    if (voltage >= 4.20f) return 100;
+    if (voltage <= floor) return 0;
+    float floorPercent = BatteryCurvePercentage(floor);
+    float percent = 100 * (BatteryCurvePercentage(voltage) - floorPercent) / (100 - floorPercent);
+    return (uint8_t)constrain((int)lroundf(percent), 0, 100);
 }
 
 int BatteryUpdateInterval(float voltage)
 {
-    if (!(voltage >= 1.0f && voltage <= 5.0f)) return 1;
-    return BatteryIntervalForPercentage(BatteryPercentage(voltage));
+    if (!(voltage >= 1.0f && voltage <= 5.0f) || BatteryLifeEstimateSeconds < 0) return 1;
+    if (BatteryLifeEstimateSeconds > 4 * 86400) return 1;
+    if (BatteryLifeEstimateSeconds > 2 * 86400) return 2;
+    if (BatteryLifeEstimateSeconds > 86400) return 4;
+    if (BatteryLifeEstimateSeconds > 12 * 3600) return 8;
+    return 16;
 }
 
 void UpdateBatteryLifeEstimate(time_t now)
 {
-    if (BatteryVoltage < 1.0f || now < 1600000000)
-        return;
-
+    if (BatteryVoltage < 1.0f) return;
+    static BatteryHistory history;
     Preferences prefs;
-    if (!prefs.begin("battlife2", false))
-        return;
-    float anchorPercent = prefs.getFloat("anchor_pct", -1.0f);
-    time_t anchorTime = (time_t)prefs.getULong64("anchor_time", 0);
-    float drainPercentPerDay = prefs.getFloat("drain_rate", 0.0f);
-    float percent = BatteryPercentage(BatteryVoltage);
-    bool save = false;
-
-    if (anchorPercent < 0.0f || anchorPercent > 100.0f || anchorTime == 0 || now <= anchorTime || now - anchorTime > 30 * 86400)
+    if (prefs.begin("battery-trace", false))
     {
-        anchorPercent = percent;
-        anchorTime = now;
-        drainPercentPerDay = 0.0f;
-        save = true;
+        if (prefs.getBytesLength("history") == sizeof(history))
+            prefs.getBytes("history", &history, sizeof(history));
+        if (now >= 1600000000 && RecordBatterySample(history, now, lroundf(BatteryVoltage * 1000), BATTERY_FLOOR_MV) &&
+            prefs.putBytes("history", &history, sizeof(history)) != sizeof(history))
+            Serial.println("Battery history save failed");
+        prefs.end();
     }
-    else if (percent >= anchorPercent + 5.0f)
-    {
-        anchorPercent = percent;
-        anchorTime = now;
-        drainPercentPerDay = 0.0f;
-        save = true;
-    }
-    else if (anchorPercent - percent >= 1.0f && now - anchorTime >= 3600)
-    {
-        float observedRate = (anchorPercent - percent) * 86400.0f / difftime(now, anchorTime);
-        drainPercentPerDay = drainPercentPerDay > 0.0f ? (drainPercentPerDay + observedRate) / 2.0f : observedRate;
-        anchorPercent = percent;
-        anchorTime = now;
-        save = true;
-    }
-
-    if (save)
-    {
-        prefs.putFloat("anchor_pct", anchorPercent);
-        prefs.putULong64("anchor_time", (uint64_t)anchorTime);
-        prefs.putFloat("drain_rate", drainPercentPerDay);
-    }
-    if (drainPercentPerDay > 0.0f)
-    {
-        double seconds = percent * 86400.0 / drainPercentPerDay;
-        const double maxSeconds = (99 * 24 * 60 + 23 * 60 + 59) * 60.0;
-        BatteryLifeEstimateSeconds = (int64_t)constrain(seconds, 0.0, maxSeconds);
-    }
-    prefs.end();
+    else Serial.println("Battery history unavailable");
+    int64_t learned = history.floor == BATTERY_FLOOR_MV ? LearnedBatterySeconds(history, lroundf(BatteryVoltage * 1000)) : -1;
+    int64_t estimate = learned >= 0 ? learned * 8 / 10 :
+                       (int64_t)BatteryPercentage(BatteryVoltage) * BATTERY_RUNTIME_DAYS * 86400 * 8 / 1000;
+    int64_t quantum = estimate >= 2 * 86400 ? 12 * 3600 : 3600;
+    BatteryLifeEstimateSeconds = estimate / quantum * quantum;
+    Serial.printf("Battery trace: %u samples, %u learned; estimate %lld hours\n",
+                  history.count, history.learnedCount, (long long)(BatteryLifeEstimateSeconds / 3600));
 }
 
 String FormatBatteryLifeEstimate()
@@ -874,8 +847,6 @@ void setup()
     }
 
     BatteryVoltage = ReadBatteryVoltage();
-    UpdateIntervalHours = BatteryUpdateInterval(BatteryVoltage);
-    Serial.printf("Battery estimate %.2f V; refresh interval %d h\n", BatteryVoltage, UpdateIntervalHours);
 
     bool wifiUsed = false, wifiConnected = false;
     bool timeSynced = time(nullptr) >= 1600000000 && UpdateLocalTime();
@@ -885,7 +856,9 @@ void setup()
         wifiConnected = StartWiFi() == WL_CONNECTED;
         timeSynced = wifiConnected && SetupTime();
     }
-    if (timeSynced) UpdateBatteryLifeEstimate(time(nullptr));
+    UpdateBatteryLifeEstimate(timeSynced ? time(nullptr) : 0);
+    UpdateIntervalHours = BatteryUpdateInterval(BatteryVoltage);
+    Serial.printf("Battery estimate %.2f V; refresh interval %d h\n", BatteryVoltage, UpdateIntervalHours);
     bool updateDue = timeSynced && IsScheduledUpdate() &&
 #if DEBUG_FAKE_WEATHER && DEBUG_SERIAL_WAKE_SECONDS > 0
                      (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER || ClaimWeatherAttempt(time(nullptr)));

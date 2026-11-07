@@ -36,6 +36,8 @@ using std::min;
 using std::max;
 template<class T> T constrain(T value, T low, T high) { return min(high, max(low, value)); }
 #define DEBUG_FAKE_WEATHER 0
+#define BATTERY_FLOOR_MV 3712
+int64_t BatteryLifeEstimateSeconds = -1;
 std::map<std::string, uint64_t> saved;
 bool prefOk = true;
 struct Preferences {
@@ -54,7 +56,7 @@ int wakeCause = ESP_SLEEP_WAKEUP_TIMER;
 int esp_sleep_get_wakeup_cause() { return wakeCause; }
 '''
 harness += "\n".join(function(signature) for signature in (
-    "uint8_t BatteryPercentage(", "int BatteryIntervalForPercentage(", "int BatteryUpdateInterval(", "bool IsWeatherHour(", "bool IsScheduledUpdate(", "long SecondsUntilNextUpdate(",
+    "float BatteryCurvePercentage(", "uint8_t BatteryPercentage(", "int BatteryUpdateInterval(", "bool IsWeatherHour(", "bool IsScheduledUpdate(", "long SecondsUntilNextUpdate(",
     "long NextSleepSeconds(", "void FormatClock(", "uint32_t WeatherSlot(", "const char *WeatherScheduleNamespace(",
     "bool ClaimWeatherAttempt(", "void MarkWeatherSuccess(", "long WeatherRetrySeconds(", "float SumOfPrecip("
 ))
@@ -74,16 +76,13 @@ int main() {
     localtime_r(&transition, &before); transition += 60; localtime_r(&transition, &after);
     assert(before.tm_hour == 2 && before.tm_min == 59 && before.tm_isdst > 0);
     assert(after.tm_hour == 2 && after.tm_min == 0 && after.tm_isdst == 0);
-    const int percentages[] = {100, 51, 50, 26, 25, 13, 12, 7, 6, 3, 0};
-    const int intervals[] =   {  1,  1,  2,  2,  4,  4,  8, 8, 16, 16, 16};
-    for (size_t i = 0; i < sizeof(percentages) / sizeof(*percentages); ++i)
-        assert(BatteryIntervalForPercentage(percentages[i]) == intervals[i]);
-    for (int mv = 3500; mv <= 4200; ++mv) {
-        float voltage = mv / 1000.0f;
-        assert(BatteryUpdateInterval(voltage) == BatteryIntervalForPercentage(BatteryPercentage(voltage)));
+    assert(BatteryPercentage(4.20f) == 100 && BatteryPercentage(3.712f) == 0);
+    const int64_t seconds[] = {5 * 86400, 4 * 86400, 2 * 86400, 86400, 12 * 3600, 0};
+    const int intervals[] = {1, 2, 4, 8, 16, 16};
+    for (size_t i = 0; i < sizeof(seconds) / sizeof(*seconds); ++i) {
+        BatteryLifeEstimateSeconds = seconds[i];
+        assert(BatteryUpdateInterval(4.0f) == intervals[i]);
     }
-    assert(BatteryUpdateInterval(4.20f) == 1);
-    assert(BatteryUpdateInterval(3.50f) == 16);
     assert(BatteryUpdateInterval(0.0f) == 1);
     float rain[25]; for (int i = 0; i < 24; ++i) rain[i] = 1; rain[24] = 1000;
     assert(SumOfPrecip(rain, 24) == 24);

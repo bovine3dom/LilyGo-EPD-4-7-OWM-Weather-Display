@@ -74,12 +74,15 @@ try:
     lon = float(secrets["TRAM_STOP_LONGITUDE"])
     minutes = int(secrets.get("TRAM_MINIMUM_MINUTES", "15"))
     rail_minutes = int(secrets.get("RAIL_MINIMUM_MINUTES", "15"))
+    battery_floor = int(secrets.get("BATTERY_FLOOR_MV", "3500"))
+    battery_days = int(secrets.get("BATTERY_RUNTIME_DAYS", "10"))
     fake = int(os.environ.get("DEBUG_FAKE_WEATHER", secrets.get("DEBUG_FAKE_WEATHER", "0")))
     wake = int(os.environ.get("DEBUG_SERIAL_WAKE_SECONDS", secrets.get("DEBUG_SERIAL_WAKE_SECONDS", "0")))
 except ValueError as error:
     raise RuntimeError("Invalid numeric setting in .env.") from error
 if not (math.isfinite(lat) and math.isfinite(lon) and -89.995 <= lat <= 89.995 and -179.995 <= lon <= 179.995 and
-        0 <= minutes <= 1440 and 0 <= rail_minutes <= 1440 and fake in (0, 1) and 0 <= wake <= 3600):
+        0 <= minutes <= 1440 and 0 <= rail_minutes <= 1440 and 3000 <= battery_floor <= 4000 and
+        1 <= battery_days <= 99 and fake in (0, 1) and 0 <= wake <= 3600):
     raise RuntimeError("A numeric setting in .env is outside its permitted range.")
 
 title = stop.upper()
@@ -95,6 +98,7 @@ strings = {"TRANSITOUS_CONTACT": contact, "TRAM_STOP_NAME": stop, "TRAM_STOP_TIT
 header = "#pragma once\n" + "".join(f"#define {key} {json.dumps(value, ensure_ascii=False)}\n" for key, value in strings.items())
 header += (f"#define TRAM_STOP_LATITUDE {lat:.8f}\n#define TRAM_STOP_LONGITUDE {lon:.8f}\n"
            f"#define TRAM_MINIMUM_SECONDS {minutes * 60}\n#define RAIL_MINIMUM_SECONDS {rail_minutes * 60}\n"
+           f"#define BATTERY_FLOOR_MV {battery_floor}\n#define BATTERY_RUNTIME_DAYS {battery_days}\n"
            f"#define DEBUG_FAKE_WEATHER {fake}\n"
            f"#define DEBUG_SERIAL_WAKE_SECONDS {wake}\n")
 header_path = project_dir / ".pio" / "private_config.h"

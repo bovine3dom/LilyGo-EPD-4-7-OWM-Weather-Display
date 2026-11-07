@@ -32,17 +32,19 @@ Transit data is from [Transitous sources](https://transitous.org/sources/).
 
 The display updates every hour from 08:00 through 21:00 local time. The first successful update each day uses a full refresh. The 08:00 update also uses a full refresh. The display uses a full refresh after five partial updates.
 
-The estimated battery charge controls the update interval:
+The estimated remaining runtime controls the update interval:
 
-| Estimated charge | Interval |
+| Estimated remaining runtime | Interval |
 | --- | --- |
-| 51–100% | 1 hour |
-| 26–50% | 2 hours |
-| 13–25% | 4 hours |
-| 7–12% | 8 hours |
-| 0–6% | Once daily at 08:00 |
+| More than 4 days | 1 hour |
+| More than 2 days | 2 hours |
+| More than 1 day | 4 hours |
+| More than 12 hours | 8 hours |
+| Up to 12 hours | Once daily at 08:00 |
 
-The longer intervals start at 08:00 each day. The charge is an estimate.
+The longer intervals start at 08:00 each day. The estimate includes a 20% margin. It uses the measured battery voltage and assumes similar use in each cycle.
+
+Set `BATTERY_FLOOR_MV` to the board's reported voltage near the end of a discharge. Set `BATTERY_RUNTIME_DAYS` to the approximate runtime of a full charge. The firmware uses these values for its first estimates. It records voltage samples at least two hours apart and can learn from a long discharge. A voltage rise or a long gap starts a new trace. The estimated runtime can change with battery age, temperature and device use.
 
 The `ntp.timezone` setting uses a POSIX time-zone string. The default `CET-1CEST,M3.5.0,M10.5.0/3` follows Central European summer time. The device applies the configured transition rules automatically.
 
