@@ -29,7 +29,7 @@
 #include "rail.h"
 #include "snorkel.h"
 #include "weather_parallel.h"
-#include "battery_history.h"
+#include "battery_store.h"
 #include "graph_time.h"
 #include "button_icons.h"
 #include "lang.h"
@@ -173,24 +173,32 @@ void UpdateBatteryLifeEstimate(time_t now)
 {
     if (BatteryVoltage < 1.0f) return;
     static BatteryHistory history;
+    BatteryStore store;
+    bool loaded = LoadBatteryHistory(history, store), migrated = false;
     Preferences prefs;
-    if (prefs.begin("battery-trace", false))
+    if (!loaded && prefs.begin("battery-trace", true))
     {
-        if (prefs.getBytesLength("history") == sizeof(history))
-            prefs.getBytes("history", &history, sizeof(history));
-        if (now >= 1600000000 && RecordBatterySample(history, now, lroundf(BatteryVoltage * 1000), BATTERY_FLOOR_MV) &&
-            prefs.putBytes("history", &history, sizeof(history)) != sizeof(history))
-            Serial.println("Battery history save failed");
+        if (prefs.isKey("history") && prefs.getBytesLength("history") == sizeof(history))
+            migrated = prefs.getBytes("history", &history, sizeof(history)) == sizeof(history);
         prefs.end();
     }
-    else Serial.println("Battery history unavailable");
+    bool changed = now >= 1600000000 && RecordBatterySample(history, now, lroundf(BatteryVoltage * 1000), BATTERY_FLOOR_MV);
+    if (changed || migrated)
+    {
+        if (!SaveBatteryHistory(history, store)) Serial.println("Battery history save failed");
+        else if (migrated && prefs.begin("battery-trace", false))
+        {
+            Serial.println(prefs.remove("history") ? "Battery history migrated to SPIFFS" : "Legacy battery history removal failed");
+            prefs.end();
+        }
+    }
     int64_t learned = history.floor == BATTERY_FLOOR_MV ? LearnedBatterySeconds(history, lroundf(BatteryVoltage * 1000)) : -1;
     int64_t estimate = learned >= 0 ? learned * 8 / 10 :
                        (int64_t)BatteryPercentage(BatteryVoltage) * BATTERY_RUNTIME_DAYS * 86400 * 8 / 1000;
     int64_t quantum = estimate >= 2 * 86400 ? 12 * 3600 : 3600;
     BatteryLifeEstimateSeconds = estimate / quantum * quantum;
-    Serial.printf("Battery trace: %u samples, %u learned; estimate %lld hours\n",
-                  history.count, history.learnedCount, (long long)(BatteryLifeEstimateSeconds / 3600));
+    Serial.printf("Battery trace: %u samples, %u learned, slot %d; estimate %lld hours\n",
+                  history.count, history.learnedCount, store.slot, (long long)(BatteryLifeEstimateSeconds / 3600));
 }
 
 String FormatBatteryLifeEstimate()

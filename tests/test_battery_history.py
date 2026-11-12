@@ -81,6 +81,7 @@ def function(signature):
 
 integration = r'''
 #include "battery_history.h"
+#include "battery_store.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -93,16 +94,24 @@ template<class T> T constrain(T v, T lo, T hi) { return min(hi, max(lo, v)); }
 #define BATTERY_RUNTIME_DAYS 10
 float BatteryVoltage = 4.2f;
 int64_t BatteryLifeEstimateSeconds = -1;
-std::vector<unsigned char> storage;
+std::vector<unsigned char> storage, legacy;
+bool saveOk = true;
 struct Preferences {
     bool begin(const char*, bool) { return true; }
-    size_t getBytesLength(const char*) { return storage.size(); }
-    size_t getBytes(const char*, void *p, size_t n) { std::memcpy(p, storage.data(), n); return n; }
-    size_t putBytes(const char*, const void *p, size_t n) {
-        auto *data = static_cast<const unsigned char *>(p); storage.assign(data, data + n); return n;
-    }
+    bool isKey(const char*) { return !legacy.empty(); }
+    size_t getBytesLength(const char*) { return legacy.size(); }
+    size_t getBytes(const char*, void *p, size_t n) { std::memcpy(p, legacy.data(), n); return n; }
+    bool remove(const char*) { legacy.clear(); return true; }
     void end() {}
 };
+bool LoadBatteryHistory(BatteryHistory &history, BatteryStore &store) {
+    if (storage.empty()) return false;
+    std::memcpy(&history, storage.data(), sizeof(history)); store.slot = 0; return true;
+}
+bool SaveBatteryHistory(const BatteryHistory &history, BatteryStore &) {
+    if (!saveOk) return false;
+    auto *data = reinterpret_cast<const unsigned char *>(&history); storage.assign(data, data + sizeof(history)); return true;
+}
 struct { void println(const char*) {} template<class... T> void printf(const char*, T...) {} } Serial;
 '''
 integration += '\n'.join(function(name) for name in (
@@ -130,6 +139,12 @@ int main() {
     BatteryVoltage = 4.0f;
     UpdateBatteryLifeEstimate(start + 198 * 3600);
     assert(BatteryLifeEstimateSeconds > 0 && BatteryLifeEstimateSeconds < 8 * 86400);
+    legacy = storage; storage.clear(); saveOk = false;
+    UpdateBatteryLifeEstimate(start + 202 * 3600);
+    assert(!legacy.empty() && storage.empty());
+    saveOk = true;
+    UpdateBatteryLifeEstimate(start + 204 * 3600);
+    assert(legacy.empty() && !storage.empty());
 }
 '''
 with tempfile.TemporaryDirectory() as directory:

@@ -46,6 +46,8 @@ The longer intervals start at 08:00 each day. The estimate includes a 20% margin
 
 Set `BATTERY_FLOOR_MV` to the board's reported voltage near the end of a discharge. Set `BATTERY_RUNTIME_DAYS` to the approximate runtime of a full charge. The firmware uses these values for its first estimates. It records voltage samples at least two hours apart and can learn from a long discharge. A voltage rise or a long gap starts a new trace. The estimated runtime can change with battery age, temperature and device use.
 
+The battery history uses two files in SPIFFS. Each file has a checksum. The device keeps the previous copy during a write. A SPIFFS image upload replaces these files. Back up the files before you upload a new SPIFFS image if you want to keep the history.
+
 The `ntp.timezone` setting uses a POSIX time-zone string. The default `CET-1CEST,M3.5.0,M10.5.0/3` follows Central European summer time. The device applies the configured transition rules automatically.
 
 ## Fonts
